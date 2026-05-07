@@ -10,7 +10,7 @@ from forwarder import (
     user_clients, user_dialogs,
     create_client_for_login, finalize_login,
     logout_user, is_user_logged_in,
-    load_dialogs,
+    load_dialogs, check_is_member, check_can_post,
 )
 from keyboards import (
     kb_login, kb_main, kb_groups, kb_group,
@@ -1104,6 +1104,73 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             if not selected:
                 await cb.answer("Koi channel select nahi kiya!", show_alert=True)
                 return
+
+            # ---- VALIDATION ----
+            await cb.answer("Checking permissions...")
+            failed = []
+            for did in selected:
+                ch_name = name_map.get(did, str(did))
+                if mode == "in":
+                    ok, result = await check_is_member(uid, did)
+                    if not ok:
+                        if result == "private_channel":
+                            failed.append(
+                                f"❌ *{ch_name}*\n"
+                                "   → Ye private channel hai. Pehle is channel ko join karo, tab select karo."
+                            )
+                        else:
+                            failed.append(
+                                f"❌ *{ch_name}*\n"
+                                "   → Channel access nahi mila. Pehle join karo."
+                            )
+                else:
+                    ok, result = await check_can_post(uid, did)
+                    if not ok:
+                        if result.startswith("no_permission:"):
+                            name = result.split(":", 1)[1]
+                            failed.append(
+                                f"❌ *{name}*\n"
+                                "   → Aapko is group/channel ka *Admin* banana padega.\n"
+                                "   → Telegram mein jaao → Group → Admin banao → Wapas aao."
+                            )
+                        elif result.startswith("not_member:"):
+                            name = result.split(":", 1)[1]
+                            failed.append(
+                                f"❌ *{name}*\n"
+                                "   → Aap is group ke member nahi hain. Pehle join karo."
+                            )
+                        else:
+                            failed.append(
+                                f"❌ *{ch_name}*\n"
+                                f"   → Permission error. Group mein admin rights do."
+                            )
+
+            if failed:
+                label = "Incoming" if mode == "in" else "Outgoing"
+                err_lines = "\n\n".join(failed)
+                if mode == "in":
+                    guide = (
+                        "📌 *Incoming channel ke liye:*\n"
+                        "Jis channel ke messages forward karne hain, us channel mein *aap (jis number se login kiya) joined hona chahiye.*\n\n"
+                        "Channel join karo → Wapas aao → Dobara select karo"
+                    )
+                else:
+                    guide = (
+                        "📌 *Outgoing group ke liye:*\n"
+                        "Jis group mein messages forward karne hain, usme *aapko Admin banana padega.*\n\n"
+                        "Group → Members → Apna number dhundo → Admin banao → Wapas aao → Dobara select karo"
+                    )
+                await cb.message.edit_text(
+                    f"⚠️ *{label} Validation Failed!*\n\n"
+                    f"{err_lines}\n\n"
+                    "━━━━━━━━━━━━━━━\n"
+                    f"{guide}",
+                    parse_mode="Markdown",
+                    reply_markup=kb_group(gid, g.is_active),
+                )
+                return
+
+            # ---- SAVE ----
             ch_type = "incoming" if mode == "in" else "outgoing"
             channel_list = [(did, name_map.get(did, str(did))) for did in selected]
             await db.set_channels(gid, ch_type, channel_list)
@@ -1112,13 +1179,13 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             names = "\n".join("- " + name_map.get(d, str(d)) for d in selected)
             if mode == "in":
                 await cb.message.edit_text(
-                    f"✅ *Incoming Confirmed!*\n\n{count} channel(s) set:\n{names}\n\nAb outgoing channel set karo.",
+                    f"✅ *Incoming Confirmed!*\n\n{count} channel(s) set:\n{names}\n\nAb outgoing group set karo jisme forward karna hai.",
                     parse_mode="Markdown",
                     reply_markup=kb_after_incoming(gid),
                 )
             else:
                 await cb.message.edit_text(
-                    f"✅ *Outgoing Confirmed!*\n\n{count} channel(s) set:\n{names}\n\nAb forwarding start karo!",
+                    f"✅ *Outgoing Confirmed!*\n\n{count} group(s) set:\n{names}\n\nAb forwarding start karo!",
                     parse_mode="Markdown",
                     reply_markup=kb_after_outgoing(gid),
                 )
