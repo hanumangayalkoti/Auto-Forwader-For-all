@@ -11,22 +11,63 @@ def kb_login():
 
 # ---- MAIN MENU ----
 
-def kb_main(status_line: str = ""):
+def kb_main():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("📥 Incoming Channel", callback_data="menu_inc"),
-        InlineKeyboardButton("📤 Outgoing Channel", callback_data="menu_out"),
+        InlineKeyboardButton("➕ Create Group", callback_data="ng"),
+        InlineKeyboardButton("⚙️ Manage Groups", callback_data="grp_list"),
     )
     kb.add(
-        InlineKeyboardButton("▶️ Start Forwarding", callback_data="quick_start"),
-        InlineKeyboardButton("⏹ Stop Forwarding",  callback_data="quick_stop"),
+        InlineKeyboardButton("✏️ Rename Group", callback_data="rename_prompt"),
+        InlineKeyboardButton("📊 Group Status", callback_data="st"),
     )
-    kb.add(
-        InlineKeyboardButton("📊 Status",  callback_data="st"),
-        InlineKeyboardButton("❓ Help",    callback_data="hl"),
-    )
-    kb.add(InlineKeyboardButton("⚙️ Manage Groups", callback_data="grp_list"))
+    kb.add(InlineKeyboardButton("🔙 Back", callback_data="mm"))
     kb.add(InlineKeyboardButton("💳 Subscribe / Renew", callback_data="subscribe"))
+    return kb
+
+
+# ---- LOGOUT CONFIRM ----
+
+def kb_logout_confirm():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Confirm Logout", callback_data="logout_confirm"),
+        InlineKeyboardButton("❌ No, Cancel", callback_data="logout_cancel"),
+    )
+    return kb
+
+
+# ---- STARTALL CONFIRM ----
+
+def kb_startall_confirm():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("▶️ Start Kar Do", callback_data="startall_confirm"),
+        InlineKeyboardButton("❌ Cancel", callback_data="startall_cancel"),
+    )
+    return kb
+
+
+# ---- STOPALL CONFIRM ----
+
+def kb_stopall_confirm():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("⏹ Stop Kar Do", callback_data="stopall_confirm"),
+        InlineKeyboardButton("❌ Cancel", callback_data="stopall_cancel"),
+    )
+    return kb
+
+
+# ---- STATUS MENU ----
+
+def kb_status_menu():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📋 Status Groups", callback_data="status_groups"),
+        InlineKeyboardButton("💳 Status Subscription", callback_data="status_sub"),
+    )
+    kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="mm"))
     return kb
 
 
@@ -122,7 +163,7 @@ def kb_after_outgoing(gid: int):
 def kb_after_start(gid: int):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("📊 Status",      callback_data="st"),
+        InlineKeyboardButton("📊 Status",     callback_data="status_groups"),
         InlineKeyboardButton("⏹ Stop Group", callback_data="gx:" + str(gid)),
     )
     kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="mm"))
