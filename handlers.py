@@ -443,7 +443,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                     login_states.pop(uid, None)
                     await msg.answer(
                         "❌ *Ye number Telegram pe ban hai!*\n\n"
-                        "Is number se login nahi ho sakta.\n"
+                        "Is numberk se login nahi ho sakta.\n"
                         "Dusra number try karo ya /login se dobara shuru karo.",
                         parse_mode="Markdown",
                     )
