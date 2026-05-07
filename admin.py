@@ -274,3 +274,21 @@ def register_admin(dp: Dispatcher):
             await msg.answer("✅ Cancel ho gaya.")
 
     return broadcast_state
+@dp.message_handler(commands=["removeuser"])
+async def cmd_removeuser(msg: types.Message):
+    if not is_owner(msg.from_user.id):
+        return
+    parts = msg.text.split()
+    if len(parts) != 2:
+        await msg.answer("Usage: `/removeuser <user_id>`", parse_mode="Markdown")
+        return
+    try:
+        uid = int(parts[1])
+    except ValueError:
+        await msg.answer("User ID number mein dalo.")
+        return
+    ok = await give_days(uid, -99999)  # effectively expire karo
+    if ok:
+        await msg.answer(f"✅ User `{uid}` ka access remove ho gaya!", parse_mode="Markdown")
+    else:
+        await msg.answer(f"❌ User `{uid}` nahi mila.", parse_mode="Markdown")
