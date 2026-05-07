@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 
 from aiogram import types, Bot
@@ -137,6 +138,11 @@ def _status_line(user, reason: str) -> str:
         d = reason.split(":")[1]
         return f"⏳ Free Trial — {d} din bacha"
     return ""
+
+
+def _extract_otp(text: str) -> str:
+    digits = re.sub(r'\D', '', text)
+    return digits
 
 
 def register_handlers(dp: Dispatcher, bot: Bot):
@@ -317,7 +323,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             "━━━━━━━━━━━━━━━━━━━\n"
             "1. `/login` bhejo\n"
             "2. Phone number dalo (e.g. `+919876543210`)\n"
-            "3. Telegram se aaya OTP dalo\n"
+            "3. OTP aaye to koi bhi word + OTP likho (e.g. `code12345`)\n"
             "4. (Agar 2FA hai) Password bhi dalo\n"
             "5. Done! `/start` se main menu khulega\n\n"
 
@@ -381,7 +387,6 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                     f"Ye message *{count} users* ko jayega.\n"
                     "Confirm karo?",
                     parse_mode="Markdown",
-                    reply_markup=kb_confirm_broadcast() if True else None,
                 )
                 from keyboards import kb_confirm_broadcast
                 await msg.answer("Confirm?", reply_markup=kb_confirm_broadcast())
@@ -396,10 +401,21 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             from telethon.errors import (
                 SessionPasswordNeededError, PhoneCodeInvalidError,
                 PhoneCodeExpiredError, PasswordHashInvalidError,
+                FloodWaitError, PhoneNumberInvalidError,
+                PhoneNumberBannedError, PhoneNumberUnoccupiedError,
             )
 
             if ls["step"] == "phone":
-                phone = text
+                phone = text.strip()
+                if not phone.startswith("+") or not phone[1:].isdigit():
+                    await msg.answer(
+                        "❌ *Phone number galat format mein hai!*\n\n"
+                        "Country code ke saath dalo:\n"
+                        "Example: `+919876543210`\n\n"
+                        "Dobara try karo:",
+                        parse_mode="Markdown",
+                    )
+                    return
                 try:
                     client = await create_client_for_login(uid)
                     result = await client.send_code_request(phone)
@@ -408,25 +424,74 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                     ls["step"] = "otp"
                     await msg.answer(
                         "📨 *Login — Step 2/3*\n\n"
-                        "OTP Telegram pe bhej diya!\n"
-                        "Ab OTP dalo (sirf numbers):\n"
-                        "Example: `12345`",
+                        "✅ OTP Telegram pe bhej diya!\n\n"
+                        "⚠️ *Important:* OTP seedha mat bhejo!\n"
+                        "Koi bhi word + OTP likho:\n"
+                        "Example: `code12345` ya `hello12345`\n\n"
+                        "_(Ye Telegram security bypass ke liye zaroori hai)_",
+                        parse_mode="Markdown",
+                    )
+                except PhoneNumberInvalidError:
+                    login_states.pop(uid, None)
+                    await msg.answer(
+                        "❌ *Phone number invalid hai!*\n\n"
+                        "Ye number Telegram pe registered nahi hai.\n"
+                        "Sahi number dalo aur dobara /login karo.",
+                        parse_mode="Markdown",
+                    )
+                except PhoneNumberBannedError:
+                    login_states.pop(uid, None)
+                    await msg.answer(
+                        "❌ *Ye number Telegram pe ban hai!*\n\n"
+                        "Is number se login nahi ho sakta.\n"
+                        "Dusra number try karo ya /login se dobara shuru karo.",
+                        parse_mode="Markdown",
+                    )
+                except PhoneNumberUnoccupiedError:
+                    login_states.pop(uid, None)
+                    await msg.answer(
+                        "❌ *Ye number Telegram pe registered nahi hai!*\n\n"
+                        "Pehle Telegram app se account banao, phir dobara /login karo.",
+                        parse_mode="Markdown",
+                    )
+                except FloodWaitError as e:
+                    login_states.pop(uid, None)
+                    await msg.answer(
+                        f"⏳ *Telegram ne temporarily block kiya hai!*\n\n"
+                        f"Bahut zyada attempts ho gaye. {e.seconds} seconds baad dobara try karo.\n"
+                        f"({e.seconds // 60} minute {e.seconds % 60} second)",
                         parse_mode="Markdown",
                     )
                 except Exception as e:
                     login_states.pop(uid, None)
                     await msg.answer(
-                        f"❌ Phone number galat ya error:\n`{e}`\n\nDobara /login karo.",
+                        f"❌ *Login shuru karne mein error aaya!*\n\n"
+                        f"Error: `{e}`\n\n"
+                        "Thodi der baad dobara /login karo.\n"
+                        "Agar problem bani rahe toh support se contact karo.",
                         parse_mode="Markdown",
                     )
                 return
 
             if ls["step"] == "otp":
-                otp = text.replace(" ", "").replace("-", "")
+                otp = _extract_otp(text)
+                if not otp:
+                    await msg.answer(
+                        "❌ *OTP mein koi number nahi mila!*\n\n"
+                        "Koi bhi word + OTP likho:\n"
+                        "Example: `code12345` ya `hello12345`\n\n"
+                        "Dobara try karo:",
+                        parse_mode="Markdown",
+                    )
+                    return
                 client = user_clients.get(uid)
                 if not client:
                     login_states.pop(uid, None)
-                    await msg.answer("Session expire ho gaya. Dobara /login karo.")
+                    await msg.answer(
+                        "⚠️ *Session expire ho gaya!*\n\n"
+                        "Connection toot gayi thi. Dobara /login karo.",
+                        parse_mode="Markdown",
+                    )
                     return
                 try:
                     await client.sign_in(
@@ -438,6 +503,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                     await finalize_login(uid)
                     await msg.answer(
                         "✅ *Login Ho Gaye!*\n\n"
+                        "Aapka Telegram account successfully connect ho gaya!\n\n"
                         "Ab /start karo aur forwarding setup karo!",
                         parse_mode="Markdown",
                     )
@@ -445,39 +511,90 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                     ls["step"] = "2fa"
                     await msg.answer(
                         "🔒 *Login — Step 3/3*\n\n"
-                        "2-Step Verification ON hai.\n"
-                        "Apna Telegram password dalo:",
+                        "2-Step Verification ON hai.\n\n"
+                        "Apna Telegram *cloud password* dalo\n"
+                        "_(wo password jo tumne Telegram settings mein set kiya tha)_:",
                         parse_mode="Markdown",
                     )
-                except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+                except PhoneCodeInvalidError:
+                    await msg.answer(
+                        "❌ *OTP galat hai!*\n\n"
+                        "Tumne jo number dala wo match nahi kiya.\n\n"
+                        "Dhyan rakhna:\n"
+                        "• Sirf numbers extract kiye jaate hain\n"
+                        "• Example: `code12345` → OTP `12345`\n\n"
+                        "Dobara OTP dalo ya /login se restart karo:",
+                        parse_mode="Markdown",
+                    )
+                except PhoneCodeExpiredError:
                     login_states.pop(uid, None)
-                    await msg.answer(f"❌ OTP galat ya expire:\n`{e}`\n\nDobara /login karo.", parse_mode="Markdown")
+                    await msg.answer(
+                        "⏰ *OTP expire ho gaya!*\n\n"
+                        "OTP sirf 2 minute tak valid hota hai.\n\n"
+                        "Dobara /login karo aur OTP aate hi turant bhejo.",
+                        parse_mode="Markdown",
+                    )
+                except FloodWaitError as e:
+                    login_states.pop(uid, None)
+                    await msg.answer(
+                        f"⏳ *Telegram ne temporarily block kiya!*\n\n"
+                        f"Bahut zyada galat attempts. {e.seconds} seconds baad try karo.\n"
+                        f"({e.seconds // 60} minute {e.seconds % 60} second)",
+                        parse_mode="Markdown",
+                    )
                 except Exception as e:
                     login_states.pop(uid, None)
-                    await msg.answer(f"❌ Error:\n`{e}`\n\nDobara /login karo.", parse_mode="Markdown")
+                    await msg.answer(
+                        f"❌ *Login mein unexpected error aaya!*\n\n"
+                        f"Error: `{e}`\n\n"
+                        "Dobara /login karo. Problem bani rahe toh support contact karo.",
+                        parse_mode="Markdown",
+                    )
                 return
 
             if ls["step"] == "2fa":
                 client = user_clients.get(uid)
                 if not client:
                     login_states.pop(uid, None)
-                    await msg.answer("Session expire ho gaya. Dobara /login karo.")
+                    await msg.answer(
+                        "⚠️ *Session expire ho gaya!*\n\n"
+                        "Connection toot gayi. Dobara /login karo.",
+                        parse_mode="Markdown",
+                    )
                     return
                 try:
-                    from telethon.errors import PasswordHashInvalidError
                     await client.sign_in(password=text)
                     login_states.pop(uid, None)
                     await finalize_login(uid)
                     await msg.answer(
                         "✅ *Login Ho Gaye!*\n\n"
+                        "2FA verify ho gaya! Aapka account successfully connect hua.\n\n"
                         "Ab /start karo aur forwarding setup karo!",
                         parse_mode="Markdown",
                     )
                 except PasswordHashInvalidError:
-                    await msg.answer("❌ Password galat hai. Dobara dalo:")
+                    await msg.answer(
+                        "❌ *Password galat hai!*\n\n"
+                        "Ye wo password hai jo tumne Telegram Settings → Privacy & Security → Two-Step Verification mein set kiya tha.\n\n"
+                        "Sahi password dalo:",
+                        parse_mode="Markdown",
+                    )
+                except FloodWaitError as e:
+                    login_states.pop(uid, None)
+                    await msg.answer(
+                        f"⏳ *Bahut zyada galat attempts!*\n\n"
+                        f"Telegram ne {e.seconds} seconds ke liye block kiya.\n"
+                        f"({e.seconds // 60} minute baad try karo)",
+                        parse_mode="Markdown",
+                    )
                 except Exception as e:
                     login_states.pop(uid, None)
-                    await msg.answer(f"❌ Error:\n`{e}`\n\nDobara /login karo.", parse_mode="Markdown")
+                    await msg.answer(
+                        f"❌ *Password verify karne mein error!*\n\n"
+                        f"Error: `{e}`\n\n"
+                        "Dobara /login karo.",
+                        parse_mode="Markdown",
+                    )
                 return
 
         # RENAME FLOW
@@ -685,7 +802,6 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             if not dialogs:
                 await cb.answer("Koi channel nahi mila! /login karo.", show_alert=True)
                 return
-            # Load existing selection
             existing = await db.get_channels(gid, "incoming" if mode == "in" else "outgoing")
             selected = {ch.channel_id for ch in existing}
             _set_selected(uid, gid, mode, selected)
@@ -864,105 +980,38 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                 reply_markup=kb_delete_confirm(gid),
             )
 
-        elif data.startswith("gdf:"):
+        elif data.startswith("gdc:"):
             gid = int(data[4:])
             g = await db.get_group(gid)
             if not g or g.user_id != uid:
                 return
-            name = g.name
             await db.delete_group(gid)
-            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            kb = InlineKeyboardMarkup(row_width=2)
-            kb.add(
-                InlineKeyboardButton("⚙️ Groups", callback_data="grp_list"),
-                InlineKeyboardButton("🏠 Main Menu", callback_data="mm"),
+            groups = await _groups_to_dict(uid)
+            if not groups:
+                from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+                kb = InlineKeyboardMarkup()
+                kb.add(InlineKeyboardButton("➕ New Group", callback_data="ng"))
+                kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="mm"))
+                await cb.message.edit_text(
+                    "✅ Group delete ho gaya!\n\nKoi group nahi bacha.",
+                    reply_markup=kb,
+                )
+            else:
+                await cb.message.edit_text(
+                    "✅ Group delete ho gaya!\n\n*Baaki Groups:*",
+                    parse_mode="Markdown",
+                    reply_markup=kb_groups(groups),
+                )
+
+        elif data.startswith("gdx:"):
+            gid = int(data[4:])
+            g = await db.get_group(gid)
+            if not g or g.user_id != uid:
+                return
+            await cb.message.edit_text(
+                await _text_group(uid, gid),
+                parse_mode="Markdown",
+                reply_markup=kb_group(gid, g.is_active),
             )
-            await cb.message.edit_text(f"🗑 '*{name}*' delete ho gaya!", parse_mode="Markdown", reply_markup=kb)
-
-        elif data == "sa":
-            groups = await db.get_user_groups(uid)
-            count = 0
-            for g in groups:
-                in_chs = [ch for ch in g.channels if ch.type == "incoming"]
-                out_chs = [ch for ch in g.channels if ch.type == "outgoing"]
-                if in_chs and out_chs:
-                    await db.set_group_active(g.id, True)
-                    count += 1
-            await cb.answer(f"▶️ {count} group(s) start ho gaye!", show_alert=True)
-
-        elif data == "xa":
-            await db.set_group_active_for_user(uid, False)
-            await cb.answer("⏹ Sab groups band ho gaye!", show_alert=True)
-
-        elif data == "quick_start":
-            groups = await db.get_user_groups(uid)
-            count = 0
-            for g in groups:
-                in_chs = [ch for ch in g.channels if ch.type == "incoming"]
-                out_chs = [ch for ch in g.channels if ch.type == "outgoing"]
-                if in_chs and out_chs:
-                    await db.set_group_active(g.id, True)
-                    count += 1
-            if count == 0:
-                await cb.answer("Koi configured group nahi! Pehle setup karo.", show_alert=True)
-            else:
-                await cb.answer(f"▶️ {count} group(s) start ho gaye!", show_alert=True)
-
-        elif data == "quick_stop":
-            await db.set_group_active_for_user(uid, False)
-            await cb.answer("⏹ Sab forwarding band ho gaya!", show_alert=True)
-
-        elif data == "menu_inc":
-            groups = await _groups_to_dict(uid)
-            if not groups:
-                from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-                kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("➕ New Group", callback_data="ng"))
-                kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="mm"))
-                await cb.message.edit_text("Pehle ek group banao:", reply_markup=kb)
-            elif len(groups) == 1:
-                gid = groups[0]["id"]
-                await load_dialogs(uid)
-                dialogs = _get_dialogs(uid)
-                selected = _get_selected(uid, gid, "in")
-                g = await db.get_group(gid)
-                await cb.message.edit_text(
-                    f"*{groups[0]['name']} — Incoming*\nSelect karo:",
-                    parse_mode="Markdown",
-                    reply_markup=kb_channels(gid, "in", dialogs, selected),
-                )
-            else:
-                from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-                kb = InlineKeyboardMarkup(row_width=1)
-                for g in groups:
-                    kb.add(InlineKeyboardButton(g["name"], callback_data="gi:" + str(g["id"])))
-                kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="mm"))
-                await cb.message.edit_text("Kaun se group ka incoming set karna hai?", reply_markup=kb)
-
-        elif data == "menu_out":
-            groups = await _groups_to_dict(uid)
-            if not groups:
-                from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-                kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("➕ New Group", callback_data="ng"))
-                kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="mm"))
-                await cb.message.edit_text("Pehle ek group banao:", reply_markup=kb)
-            elif len(groups) == 1:
-                gid = groups[0]["id"]
-                await load_dialogs(uid)
-                dialogs = _get_dialogs(uid)
-                selected = _get_selected(uid, gid, "out")
-                await cb.message.edit_text(
-                    f"*{groups[0]['name']} — Outgoing*\nSelect karo:",
-                    parse_mode="Markdown",
-                    reply_markup=kb_channels(gid, "out", dialogs, selected),
-                )
-            else:
-                from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-                kb = InlineKeyboardMarkup(row_width=1)
-                for g in groups:
-                    kb.add(InlineKeyboardButton(g["name"], callback_data="go:" + str(g["id"])))
-                kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="mm"))
-                await cb.message.edit_text("Kaun se group ka outgoing set karna hai?", reply_markup=kb)
 
         await cb.answer()
