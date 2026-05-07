@@ -217,3 +217,39 @@ async def stop_all_for_user(uid: int):
 
 async def get_client(uid: int) -> Optional[TelegramClient]:
     return user_clients.get(uid)
+
+async def check_is_member(uid: int, channel_id: int) -> tuple[bool, str]:
+    """Verify the Telethon account can read messages from this channel (is joined)."""
+    client = user_clients.get(uid)
+    if not client:
+        return False, "Client nahi mila"
+    try:
+        entity = await client.get_entity(channel_id)
+        name = getattr(entity, "title", None) or getattr(entity, "first_name", str(channel_id))
+        msgs = await client.get_messages(entity, limit=1)
+        _ = msgs
+        return True, name
+    except Exception as e:
+        err = str(e)
+        if "private" in err.lower() or "access" in err.lower() or "invite" in err.lower():
+            return False, f"private_channel"
+        return False, f"error:{err}"
+
+
+async def check_can_post(uid: int, channel_id: int) -> tuple[bool, str]:
+    """Verify the Telethon account has permission to send messages in this chat."""
+    client = user_clients.get(uid)
+    if not client:
+        return False, "Client nahi mila"
+    try:
+        entity = await client.get_entity(channel_id)
+        name = getattr(entity, "title", None) or getattr(entity, "first_name", str(channel_id))
+        perms = await client.get_permissions(entity)
+        if not perms.send_messages:
+            return False, f"no_permission:{name}"
+        return True, name
+    except Exception as e:
+        err = str(e)
+        if "not a member" in err.lower() or "kicked" in err.lower():
+            return False, f"not_member:{str(channel_id)}"
+        return False, f"error:{err}"
