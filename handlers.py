@@ -321,11 +321,11 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             "━━━━━━━━━━━━━━━━━━━\n"
             "*🔐 Login Kaise Kare:*\n"
             "━━━━━━━━━━━━━━━━━━━\n"
-            "1. `/login` bhejo\n"
+            "1. /login bhejo\n"
             "2. Phone number dalo (e.g. `+919876543210`)\n"
             "3. OTP aaye to koi bhi word + OTP likho (e.g. `code12345`)\n"
             "4. (Agar 2FA hai) Password bhi dalo\n"
-            "5. Done! `/start` se main menu khulega\n\n"
+            "5. Done! /start se main menu khulega\n\n"
 
             "━━━━━━━━━━━━━━━━━━━\n"
             "*⚙️ Forwarding Setup:*\n"
@@ -338,15 +338,15 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             "━━━━━━━━━━━━━━━━━━━\n"
             "*📋 Saare Commands:*\n"
             "━━━━━━━━━━━━━━━━━━━\n"
-            "`/start` — Main menu\n"
-            "`/login` — Telegram account se login\n"
-            "`/logout` — Logout karo\n"
-            "`/groups` — Groups manage karo\n"
-            "`/status` — Forwarding status dekho\n"
-            "`/startall` — Saare groups start\n"
-            "`/stopall` — Saare groups band\n"
-            "`/subscribe` — ₹69/month subscription lo\n"
-            "`/help` — Ye message\n\n"
+            "/start — Main menu\n"
+            "/login — Telegram account se login\n"
+            "/logout — Logout karo\n"
+            "/groups — Groups manage karo\n"
+            "/status — Forwarding status dekho\n"
+            "/startall — Saare groups start\n"
+            "/stopall — Saare groups band\n"
+            "/subscribe — ₹69/month subscription lo\n"
+            "/help — Ye message\n\n"
 
             "━━━━━━━━━━━━━━━━━━━\n"
             "*✨ Features:*\n"
@@ -364,7 +364,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             "- 7 din FREE trial\n"
             "- Uske baad ₹69/month\n"
             "- UPI, Card, Net Banking accept\n"
-            "- `/subscribe` se pay karo"
+            "- /subscribe se pay karo"
         )
         await msg.answer(text, parse_mode="Markdown", reply_markup=kb_main_menu_only())
 
@@ -428,7 +428,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                         "⚠️ *Important:* OTP seedha mat bhejo!\n"
                         "Koi bhi word + OTP likho:\n"
                         "Example: `code12345` ya `hello12345`\n\n"
-                        "_(Ye Telegram security bypass ke liye zaroori hai)_",
+                        "_(Ye Important he Login karne ke liye)_",
                         parse_mode="Markdown",
                     )
                 except PhoneNumberInvalidError:
