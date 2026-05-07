@@ -45,9 +45,10 @@ async def main():
 
     logging.info("Bot polling shuru ho raha hai...")
     try:
-        await dp.start_polling(skip_updates=True)
+        await dp.skip_updates()
+        await dp.start_polling()
     finally:
-        await bot.session.close()
+        await bot.close()
 
 
 if __name__ == "__main__":
