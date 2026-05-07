@@ -4,12 +4,13 @@ from typing import Optional
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import Channel, Chat, User as TLUser
 
 from config import API_ID, API_HASH
 from database import (
     get_all_sessions, save_session, delete_session,
     get_user_groups, get_channels, get_all_active_groups,
-    set_group_active,
+    set_group_active, set_group_active_for_user,
 )
 
 # user_id → TelegramClient
@@ -17,6 +18,18 @@ user_clients: dict[int, TelegramClient] = {}
 
 # user_id → [(chat_id, name), ...]
 user_dialogs: dict[int, list[tuple[int, str]]] = {}
+
+DIALOG_LIMIT = 20
+
+
+def _normalize_id(entity) -> int:
+    if isinstance(entity, Channel):
+        return int(f"-100{entity.id}")
+    elif isinstance(entity, Chat):
+        return -entity.id
+    elif isinstance(entity, TLUser):
+        return entity.id
+    return getattr(entity, 'id', 0)
 
 
 async def _copy_with_download(client: TelegramClient, target_id: int, message):
@@ -66,16 +79,51 @@ def _make_handler(uid: int, client: TelegramClient):
 
 async def load_dialogs(uid: int) -> list[tuple[int, str]]:
     client = user_clients.get(uid)
-    if not client or not client.is_connected():
+    if not client:
+        print(f"[Dialog Load] user={uid}: No client found")
         return []
+
+    if not client.is_connected():
+        try:
+            await client.connect()
+        except Exception as err:
+            print(f"[Dialog Load] user={uid}: Reconnect failed: {err}")
+            return []
+
     try:
-        dialogs = await client.get_dialogs()
+        # Fetch more dialogs so we can sort properly
+        all_dialogs = await client.get_dialogs(limit=100)
+
+        # Sort: pinned first, then by last message time (default order)
+        pinned = [d for d in all_dialogs if d.pinned]
+        non_pinned = [d for d in all_dialogs if not d.pinned]
+        sorted_dialogs = pinned + non_pinned
+
+        # Take top DIALOG_LIMIT
+        top_dialogs = sorted_dialogs[:DIALOG_LIMIT]
+
         result = []
-        for d in dialogs:
-            name = d.name or getattr(d, "title", None) or "Unnamed"
-            result.append((d.id, name))
+        for d in top_dialogs:
+            try:
+                entity = d.entity
+                name = (
+                    getattr(entity, 'title', None)
+                    or getattr(entity, 'first_name', None)
+                    or d.name
+                    or "Unnamed"
+                )
+                chat_id = _normalize_id(entity)
+                if chat_id != 0:
+                    pin_mark = "📌 " if d.pinned else ""
+                    result.append((chat_id, pin_mark + name))
+            except Exception as e:
+                print(f"[Dialog Load] user={uid}: Skipping dialog: {e}")
+                continue
+
         user_dialogs[uid] = result
+        print(f"[Dialog Load] user={uid}: Loaded {len(result)} dialogs (pinned: {len(pinned)})")
         return result
+
     except Exception as err:
         print(f"[Dialog Load Error] user={uid}: {err}")
         return []
@@ -147,7 +195,9 @@ async def is_user_logged_in(uid: int) -> bool:
     if not client:
         return False
     try:
-        return client.is_connected() and await client.is_user_authorized()
+        if not client.is_connected():
+            await client.connect()
+        return await client.is_user_authorized()
     except Exception:
         return False
 
