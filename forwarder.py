@@ -4,7 +4,7 @@ from typing import Optional
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import Channel, Chat, User as TLUser
+from telethon.tl.types import Channel as TLChannel, Chat as TLChat, User as TLUser
 
 from config import API_ID, API_HASH
 from database import (
@@ -19,13 +19,20 @@ user_clients: dict[int, TelegramClient] = {}
 # user_id → [(chat_id, name), ...]
 user_dialogs: dict[int, list[tuple[int, str]]] = {}
 
+# In-memory active group cache: user_id → [{group_id, incoming_ids, outgoing_ids}]
+# Refreshed on start/stop/login
+_group_cache: dict[int, list[dict]] = {}
+
 DIALOG_LIMIT = 20
+
+# Minimum delay between forwarded messages (seconds)
+FORWARD_DELAY = 0.4
 
 
 def _normalize_id(entity) -> int:
-    if isinstance(entity, Channel):
+    if isinstance(entity, TLChannel):
         return int(f"-100{entity.id}")
-    elif isinstance(entity, Chat):
+    elif isinstance(entity, TLChat):
         return -entity.id
     elif isinstance(entity, TLUser):
         return entity.id
@@ -48,20 +55,28 @@ async def _copy_with_download(client: TelegramClient, target_id: int, message):
     )
 
 
+async def _refresh_group_cache(uid: int):
+    """Reload active groups for user into memory cache."""
+    groups = await get_user_groups(uid)
+    cache = []
+    for g in groups:
+        if not g.is_active:
+            continue
+        inc = {ch.channel_id for ch in g.channels if ch.type == "incoming"}
+        out = [ch.channel_id for ch in g.channels if ch.type == "outgoing"]
+        if inc and out:
+            cache.append({"id": g.id, "name": g.name, "incoming": inc, "outgoing": out})
+    _group_cache[uid] = cache
+
+
 def _make_handler(uid: int, client: TelegramClient):
     @client.on(events.NewMessage)
     async def forwarder(event):
-        groups = await get_all_active_groups()
-        for group in groups:
-            if group.user_id != uid:
+        cached = _group_cache.get(uid, [])
+        for grp in cached:
+            if event.chat_id not in grp["incoming"]:
                 continue
-            if not group.is_active:
-                continue
-            incoming_ids = {ch.channel_id for ch in group.channels if ch.type == "incoming"}
-            outgoing_ids = [ch.channel_id for ch in group.channels if ch.type == "outgoing"]
-            if event.chat_id not in incoming_ids:
-                continue
-            for tgt_id in outgoing_ids:
+            for tgt_id in grp["outgoing"]:
                 try:
                     m = event.message
                     if m.media:
@@ -71,8 +86,16 @@ def _make_handler(uid: int, client: TelegramClient):
                             await _copy_with_download(client, tgt_id, m)
                     elif m.message:
                         await client.send_message(tgt_id, m.message)
+                    await asyncio.sleep(FORWARD_DELAY)
                 except Exception as err:
-                    print(f"[Forward Error] user={uid} group={group.name} → {tgt_id}: {err}")
+                    err_str = str(err)
+                    # FloodWait: back off
+                    if hasattr(err, 'seconds'):
+                        wait = err.seconds + 5
+                        print(f"[FloodWait] user={uid} waiting {wait}s")
+                        await asyncio.sleep(wait)
+                    else:
+                        print(f"[Forward Error] user={uid} grp={grp['name']} → {tgt_id}: {err_str}")
 
     return forwarder
 
@@ -91,15 +114,10 @@ async def load_dialogs(uid: int) -> list[tuple[int, str]]:
             return []
 
     try:
-        # Fetch more dialogs so we can sort properly
         all_dialogs = await client.get_dialogs(limit=100)
-
-        # Sort: pinned first, then by last message time (default order)
         pinned = [d for d in all_dialogs if d.pinned]
         non_pinned = [d for d in all_dialogs if not d.pinned]
         sorted_dialogs = pinned + non_pinned
-
-        # Take top DIALOG_LIMIT
         top_dialogs = sorted_dialogs[:DIALOG_LIMIT]
 
         result = []
@@ -139,6 +157,7 @@ async def connect_user(uid: int, session_string: str) -> bool:
         user_clients[uid] = client
         _make_handler(uid, client)
         await load_dialogs(uid)
+        await _refresh_group_cache(uid)
         print(f"[Forwarder] User {uid} connected. Dialogs: {len(user_dialogs.get(uid, []))}")
         return True
     except Exception as err:
@@ -167,6 +186,7 @@ async def finalize_login(uid: int) -> Optional[str]:
         await save_session(uid, session_string)
         _make_handler(uid, client)
         await load_dialogs(uid)
+        await _refresh_group_cache(uid)
         return session_string
     except Exception as err:
         print(f"[Finalize Login Error] user={uid}: {err}")
@@ -187,6 +207,7 @@ async def logout_user(uid: int):
         del user_clients[uid]
     if uid in user_dialogs:
         del user_dialogs[uid]
+    _group_cache.pop(uid, None)
     await delete_session(uid)
 
 
@@ -213,43 +234,82 @@ async def startup_connect_all():
 
 async def stop_all_for_user(uid: int):
     await set_group_active_for_user(uid, False)
+    _group_cache.pop(uid, None)
+
+
+async def refresh_cache_for_user(uid: int):
+    """Call this after start/stop group operations."""
+    await _refresh_group_cache(uid)
 
 
 async def get_client(uid: int) -> Optional[TelegramClient]:
     return user_clients.get(uid)
 
+
 async def check_is_member(uid: int, channel_id: int) -> tuple[bool, str]:
     """Verify the Telethon account can read messages from this channel (is joined)."""
     client = user_clients.get(uid)
     if not client:
-        return False, "Client nahi mila"
+        return False, "no_client"
+    entity = None
     try:
         entity = await client.get_entity(channel_id)
         name = getattr(entity, "title", None) or getattr(entity, "first_name", str(channel_id))
-        msgs = await client.get_messages(entity, limit=1)
-        _ = msgs
+        await client.get_messages(entity, limit=1)
         return True, name
     except Exception as e:
         err = str(e)
+        entity_name = getattr(entity, 'title', str(channel_id)) if entity is not None else str(channel_id)
         if "private" in err.lower() or "access" in err.lower() or "invite" in err.lower():
-            return False, f"private_channel"
-        return False, f"error:{err}"
+            return False, "private_channel"
+        return False, f"error:{entity_name}"
 
 
 async def check_can_post(uid: int, channel_id: int) -> tuple[bool, str]:
-    """Verify the Telethon account has permission to send messages in this chat."""
+    """
+    Verify the Telethon account can send messages in this chat.
+    Returns (True, name) or (False, "error_type:name").
+
+    Error types:
+      not_member:<name>          — not joined
+      no_permission_channel:<name> — broadcast channel, not admin/editor
+      no_permission:<name>       — group restricted, no send right
+      error:<name>:<msg>         — other error
+    """
     client = user_clients.get(uid)
     if not client:
-        return False, "Client nahi mila"
+        return False, "no_client"
+    entity = None
     try:
         entity = await client.get_entity(channel_id)
-        name = getattr(entity, "title", None) or getattr(entity, "first_name", str(channel_id))
-        perms = await client.get_permissions(entity)
-        if not perms.send_messages:
-            return False, f"no_permission:{name}"
+        name = getattr(entity, "title", None) or getattr(entity, "first_name", str(channel_id)) or str(channel_id)
+
+        if isinstance(entity, TLChannel):
+            if entity.broadcast:
+                # Pure broadcast channel — need post_messages admin right
+                perms = await client.get_permissions(entity)
+                if not getattr(perms, 'post_messages', False):
+                    return False, f"no_permission_channel:{name}"
+            else:
+                # Supergroup — check send_messages
+                perms = await client.get_permissions(entity)
+                if not getattr(perms, 'send_messages', True):
+                    return False, f"no_permission:{name}"
+        elif isinstance(entity, TLChat):
+            # Regular group — all members can post by default
+            # Check if kicked/restricted
+            perms = await client.get_permissions(entity)
+            if not getattr(perms, 'send_messages', True):
+                return False, f"no_permission:{name}"
+        # TLUser (DM) — always allowed
+
         return True, name
+
     except Exception as e:
         err = str(e)
-        if "not a member" in err.lower() or "kicked" in err.lower():
-            return False, f"not_member:{str(channel_id)}"
-        return False, f"error:{err}"
+        entity_name = getattr(entity, 'title', str(channel_id)) if entity is not None else str(channel_id)
+        if "not a member" in err.lower() or "kicked" in err.lower() or "banned" in err.lower():
+            return False, f"not_member:{entity_name}"
+        if "private" in err.lower() or "access" in err.lower():
+            return False, f"not_member:{entity_name}"
+        return False, f"error:{entity_name}:{err}"
