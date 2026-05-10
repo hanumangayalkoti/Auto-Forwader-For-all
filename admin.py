@@ -1,6 +1,7 @@
+import asyncio
 from datetime import datetime
 
-from aiogram import types
+from aiogram import types, Bot
 from aiogram.dispatcher import Dispatcher
 
 from config import OWNER_ID
@@ -19,7 +20,7 @@ def is_owner(uid: int) -> bool:
     return uid == OWNER_ID
 
 
-def register_admin(dp: Dispatcher):
+def register_admin(dp: Dispatcher, bot: Bot):
 
     # ---- /admin ----
     @dp.message_handler(commands=["admin"])
@@ -107,7 +108,8 @@ def register_admin(dp: Dispatcher):
         await msg.answer(
             "📢 *Broadcast*\n\n"
             "Kya message bhejnaa chahte ho saare users ko?\n"
-            "Ab type karo (ya /cancel karo):",
+            "Ab type karo (ya /cancel karo):\n\n"
+            "⚠️ Agar /command type karo toh broadcast cancel nahi hoga — /cancel karo pehle.",
             parse_mode="Markdown",
         )
 
@@ -136,17 +138,13 @@ def register_admin(dp: Dispatcher):
                 parse_mode="Markdown",
             )
             try:
-                from aiogram import Bot
-                import config
-                b = Bot(token=config.BOT_TOKEN)
-                await b.send_message(
+                await bot.send_message(
                     uid,
                     f"🎁 *Admin ne aapko {days} din ka free access diya hai!*\n\n"
                     f"Valid until: {end_str}\n\n"
                     "Ab /start karo aur enjoy karo!",
                     parse_mode="Markdown",
                 )
-                await b.close()
             except Exception:
                 pass
         else:
@@ -178,7 +176,6 @@ def register_admin(dp: Dispatcher):
         if not user:
             await msg.answer(f"❌ User `{uid}` nahi mila database mein.", parse_mode="Markdown")
             return
-        # Expire karo by giving 0 days (sets sub_end to now)
         from datetime import timedelta
         from sqlalchemy import update
         from database import AsyncSessionLocal
@@ -187,7 +184,10 @@ def register_admin(dp: Dispatcher):
             await s.execute(
                 update(User)
                 .where(User.user_id == uid)
-                .values(sub_end=datetime.utcnow() - timedelta(days=1), trial_end=datetime.utcnow() - timedelta(days=1))
+                .values(
+                    sub_end=datetime.utcnow() - timedelta(days=1),
+                    trial_end=datetime.utcnow() - timedelta(days=1),
+                )
             )
             await s.commit()
         name = user.full_name or user.username or str(uid)
@@ -199,16 +199,12 @@ def register_admin(dp: Dispatcher):
             parse_mode="Markdown",
         )
         try:
-            from aiogram import Bot
-            import config
-            b = Bot(token=config.BOT_TOKEN)
-            await b.send_message(
+            await bot.send_message(
                 uid,
                 "⚠️ *Aapka subscription expire ho gaya hai.*\n\n"
                 "Bot use karte rehne ke liye subscribe karo: /subscribe",
                 parse_mode="Markdown",
             )
-            await b.close()
         except Exception:
             pass
 
@@ -240,11 +236,7 @@ def register_admin(dp: Dispatcher):
             parse_mode="Markdown",
         )
         try:
-            from aiogram import Bot
-            import config
-            b = Bot(token=config.BOT_TOKEN)
-            await b.send_message(uid, "🚫 Aapka access band kar diya gaya hai. Support se contact karo.")
-            await b.close()
+            await bot.send_message(uid, "🚫 Aapka access band kar diya gaya hai. Support se contact karo.")
         except Exception:
             pass
 
@@ -273,15 +265,11 @@ def register_admin(dp: Dispatcher):
             parse_mode="Markdown",
         )
         try:
-            from aiogram import Bot
-            import config
-            b = Bot(token=config.BOT_TOKEN)
-            await b.send_message(
+            await bot.send_message(
                 uid,
                 "✅ *Aapka access restore kar diya gaya hai!*\n\n/start karo.",
                 parse_mode="Markdown",
             )
-            await b.close()
         except Exception:
             pass
 
@@ -376,5 +364,43 @@ def register_admin(dp: Dispatcher):
             await msg.answer("✅ Broadcast cancel ho gaya.")
         else:
             await msg.answer("Koi active broadcast nahi hai cancel karne ke liye.")
+
+    # ---- BROADCAST CONFIRM CALLBACK ----
+    @dp.callback_query_handler(lambda cb: cb.data in ("bc_confirm", "bc_cancel"))
+    async def broadcast_confirm(cb: types.CallbackQuery):
+        uid = cb.from_user.id
+        if not is_owner(uid):
+            await cb.answer("Access nahi!", show_alert=True)
+            return
+        if cb.data == "bc_cancel":
+            broadcast_state.pop(uid, None)
+            await cb.message.edit_text("✅ Broadcast cancel ho gaya.")
+            await cb.answer()
+            return
+        state = broadcast_state.get(uid, {})
+        msg_text = state.get("text", "")
+        if not msg_text:
+            await cb.answer("Koi message nahi!", show_alert=True)
+            return
+        users = await get_all_users()
+        targets = [u for u in users if not u.is_banned]
+        await cb.message.edit_text(f"📢 Bhej raha hun {len(targets)} users ko...")
+        sent = 0
+        failed = 0
+        for u in targets:
+            try:
+                await bot.send_message(u.user_id, msg_text, parse_mode="Markdown")
+                sent += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.05)  # Rate limit: max ~20 msgs/sec
+        broadcast_state.pop(uid, None)
+        await cb.message.answer(
+            f"✅ *Broadcast Complete!*\n\n"
+            f"Delivered: {sent}/{len(targets)}\n"
+            f"Failed: {failed}",
+            parse_mode="Markdown",
+        )
+        await cb.answer()
 
     return broadcast_state
