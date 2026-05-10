@@ -14,14 +14,13 @@ def kb_login():
 def kb_main():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("➕ Create Group", callback_data="ng"),
+        InlineKeyboardButton("➕ New Group", callback_data="ng"),
         InlineKeyboardButton("⚙️ Manage Groups", callback_data="grp_list"),
     )
     kb.add(
         InlineKeyboardButton("✏️ Rename Group", callback_data="rename_prompt"),
         InlineKeyboardButton("📊 Group Status", callback_data="st"),
     )
-    kb.add(InlineKeyboardButton("🔙 Back", callback_data="mm"))
     kb.add(InlineKeyboardButton("💳 Subscribe / Renew", callback_data="subscribe"))
     return kb
 
