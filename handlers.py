@@ -11,6 +11,7 @@ from forwarder import (
     create_client_for_login, finalize_login,
     logout_user, is_user_logged_in,
     load_dialogs, check_is_member, check_can_post,
+    refresh_cache_for_user,
 )
 from keyboards import (
     kb_login, kb_main, kb_groups, kb_group,
@@ -232,9 +233,16 @@ def register_handlers(dp: Dispatcher, bot: Bot):
     # ---- /logout ----
     @dp.message_handler(commands=["logout"])
     async def cmd_logout(msg: types.Message):
+        uid = msg.from_user.id
+        if not await is_user_logged_in(uid):
+            await msg.answer(
+                "⚠️ Tum pehle se logged out ho!\n/login karke Telegram account connect karo.",
+                parse_mode="Markdown",
+            )
+            return
         await msg.answer(
             "🚪 *Logout Confirm Karo*\n\n"
-            "Logout karne se tumhara session delete ho jayega.\n"
+            "Logout karne se tumhara Telegram session delete ho jayega.\n"
             "Dobara /login karna padega.\n\n"
             "Pakka logout karna hai?",
             parse_mode="Markdown",
@@ -287,9 +295,17 @@ def register_handlers(dp: Dispatcher, bot: Bot):
         ready = sum(1 for g in groups if
                     any(ch.type == "incoming" for ch in g.channels) and
                     any(ch.type == "outgoing" for ch in g.channels))
+        if ready == 0:
+            await msg.answer(
+                "⚠️ *Koi Group Ready Nahi Hai*\n\n"
+                "Start karne ke liye group mein incoming aur outgoing dono channels set hone chahiye.\n\n"
+                "/groups se setup karo.",
+                parse_mode="Markdown",
+            )
+            return
         await msg.answer(
             f"▶️ *Start All Groups*\n\n"
-            f"Saare {ready} groups mein forwarding start ho jayegi.\n\n"
+            f"{ready} group(s) mein forwarding start ho jayegi.\n\n"
             "Confirm karo?",
             parse_mode="Markdown",
             reply_markup=kb_startall_confirm(),
@@ -320,8 +336,11 @@ def register_handlers(dp: Dispatcher, bot: Bot):
         _, reason = db.check_access(user)
         now = datetime.utcnow()
 
-        if user.is_banned:
-            await msg.answer("🚫 Aapka account ban hai. Support se contact karo.")
+        if reason == "banned":
+            await msg.answer(
+                "🚫 *Account Ban Hai*\n\nAapka access band kar diya gaya hai.\nSupport se contact karo.",
+                parse_mode="Markdown",
+            )
             return
 
         if "subscribed" in reason:
@@ -510,6 +529,13 @@ def register_handlers(dp: Dispatcher, bot: Bot):
         if uid == OWNER_ID and uid in broadcast_state:
             state = broadcast_state[uid]
             if state["step"] == "waiting_message":
+                # Ignore if owner accidentally typed a command
+                if text.startswith("/"):
+                    await msg.answer(
+                        "⚠️ Broadcast mein ho. Command type kiya toh /cancel karo pehle.\n"
+                        "Ya broadcast message likho (command nahi).",
+                    )
+                    return
                 state["text"] = text
                 state["step"] = "waiting_confirm"
                 users = await db.get_all_users()
@@ -698,20 +724,29 @@ def register_handlers(dp: Dispatcher, bot: Bot):
         # RENAME FLOW
         state = user_state.get(uid)
         if state and state.get("action") == "rename":
-            gid = state["group_id"]
-            g = await db.get_group(gid)
-            if g and g.user_id == uid:
-                new_name = text[:30]
-                await db.rename_group(gid, new_name)
+            # Auto-expire rename state after 5 minutes
+            ts = state.get("ts", 0)
+            if datetime.utcnow().timestamp() - ts > 300:
                 user_state.pop(uid, None)
-                await msg.answer(
-                    f"✅ Naam badal diya: *{new_name}*",
-                    parse_mode="Markdown",
-                    reply_markup=kb_group(gid, g.is_active),
-                )
             else:
-                user_state.pop(uid, None)
-                await msg.answer("Group nahi mila.")
+                gid = state["group_id"]
+                g = await db.get_group(gid)
+                if g and g.user_id == uid:
+                    new_name = text[:30].strip()
+                    if not new_name:
+                        await msg.answer("❌ Naam khali nahi ho sakta. Dobara likho:")
+                        return
+                    await db.rename_group(gid, new_name)
+                    user_state.pop(uid, None)
+                    await msg.answer(
+                        f"✅ Naam badal diya: *{new_name}*",
+                        parse_mode="Markdown",
+                        reply_markup=kb_group(gid, g.is_active),
+                    )
+                else:
+                    user_state.pop(uid, None)
+                    await msg.answer("Group nahi mila.")
+                return
 
     # ---- CALLBACK HANDLER ----
     @dp.callback_query_handler()
@@ -781,10 +816,12 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             fresh = await db.get_user(uid)
             if fresh:
                 now = datetime.utcnow()
-                if fresh.sub_end and fresh.sub_end > now:
-                    await cb.answer("✅ Payment confirm ho gayi! Ab bot use kar sakte ho.", show_alert=True)
+                paid_active = fresh.sub_end and fresh.sub_end > now
+                trial_active = fresh.trial_end and fresh.trial_end > now and not fresh.sub_end
+                if paid_active or trial_active:
+                    await cb.answer("✅ Access active hai! Bot use kar sakte ho.", show_alert=True)
                 else:
-                    await cb.answer("❌ Payment abhi confirm nahi hui. Pay karo ya thodi der baad check karo.", show_alert=True)
+                    await cb.answer("❌ Payment confirm nahi hui abhi. Pay karo ya 1-2 min baad check karo.", show_alert=True)
             return
 
         # ---- STATUS MENU ----
@@ -802,7 +839,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             await cb.message.answer(
                 text,
                 parse_mode="Markdown",
-                reply_markup=kb_subscribe_only() if reason in ("expired", "trial") else kb_main_menu_only(),
+                reply_markup=kb_subscribe_only() if ("trial" in reason or "expired" in reason) else kb_main_menu_only(),
             )
             await cb.answer()
             return
@@ -818,6 +855,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                 if any(ch.type == "incoming" for ch in g.channels) and any(ch.type == "outgoing" for ch in g.channels):
                     await db.set_group_active(g.id, True)
                     count += 1
+            await refresh_cache_for_user(uid)
             await cb.message.edit_text(
                 f"▶️ *{count} group(s) start ho gaye!*\n\nForwarding shuru ho gayi.",
                 parse_mode="Markdown",
@@ -834,6 +872,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
         # ---- STOPALL CONFIRM/CANCEL ----
         if data == "stopall_confirm":
             await db.set_group_active_for_user(uid, False)
+            await refresh_cache_for_user(uid)
             await cb.message.edit_text(
                 "⏹ *Sab groups band ho gaye!*",
                 parse_mode="Markdown",
@@ -847,32 +886,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             await cb.answer()
             return
 
-        # ---- BROADCAST (owner only) ----
-        if uid == OWNER_ID and data in ("bc_confirm", "bc_cancel"):
-            if data == "bc_cancel":
-                broadcast_state.pop(uid, None)
-                await cb.message.edit_text("✅ Broadcast cancel ho gaya.")
-                await cb.answer()
-                return
-            state = broadcast_state.get(uid, {})
-            msg_text = state.get("text", "")
-            if not msg_text:
-                await cb.answer("Koi message nahi!", show_alert=True)
-                return
-            users = await db.get_all_users()
-            targets = [u for u in users if not u.is_banned]
-            await cb.message.edit_text(f"📢 Bhej raha hun {len(targets)} users ko...")
-            sent = 0
-            for u in targets:
-                try:
-                    await bot.send_message(u.user_id, msg_text, parse_mode="Markdown")
-                    sent += 1
-                except Exception:
-                    pass
-            broadcast_state.pop(uid, None)
-            await cb.message.answer(f"✅ Broadcast complete! {sent}/{len(targets)} users ko deliver hua.")
-            await cb.answer()
-            return
+        # bc_confirm / bc_cancel are handled by admin.py's dedicated handler (takes priority)
 
         # ---- ACCESS CHECK for remaining callbacks ----
         if not allowed:
@@ -885,6 +899,10 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                 return
 
         # ---- MAIN MENU ----
+        # Clear rename state on any navigation callback
+        if data not in ("gr:",) and not data.startswith("gr:"):
+            user_state.pop(uid, None)
+
         if data == "mm":
             user = await db.get_or_create_user(uid, cb.from_user.username or "", cb.from_user.full_name or "")
             _, reason = db.check_access(user)
@@ -1126,23 +1144,35 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                 else:
                     ok, result = await check_can_post(uid, did)
                     if not ok:
-                        if result.startswith("no_permission:"):
+                        if result.startswith("no_permission_channel:"):
+                            name = result.split(":", 1)[1]
+                            failed.append(
+                                f"❌ *{name}* (Broadcast Channel)\n"
+                                "   → Ye ek broadcast channel hai — sirf admins post kar sakte hain.\n"
+                                "   → Apne Telegram number ko is channel ka Admin banao:\n"
+                                "   Channel → Edit → Administrators → Apna number → Post Messages ON karo"
+                            )
+                        elif result.startswith("no_permission:"):
                             name = result.split(":", 1)[1]
                             failed.append(
                                 f"❌ *{name}*\n"
-                                "   → Aapko is group/channel ka *Admin* banana padega.\n"
-                                "   → Telegram mein jaao → Group → Admin banao → Wapas aao."
+                                "   → Is group mein messages send karne ki permission nahi hai.\n"
+                                "   → Ya toh group settings change karo (sab members post kar saken),\n"
+                                "   → Ya apne number ko Admin bana do is group mein."
                             )
                         elif result.startswith("not_member:"):
                             name = result.split(":", 1)[1]
                             failed.append(
                                 f"❌ *{name}*\n"
-                                "   → Aap is group ke member nahi hain. Pehle join karo."
+                                "   → Aapka Telegram account (jis number se login kiya) is group/channel mein joined nahi hai.\n"
+                                "   → Telegram mein jaao → Group join karo → Wapas aao."
                             )
                         else:
+                            parts_r = result.split(":", 2)
+                            err_name = parts_r[1] if len(parts_r) > 1 else ch_name
                             failed.append(
-                                f"❌ *{ch_name}*\n"
-                                f"   → Permission error. Group mein admin rights do."
+                                f"❌ *{err_name}*\n"
+                                "   → Access check fail hua. Group mein joined ho aur send permission ho — check karo."
                             )
 
             if failed:
@@ -1150,18 +1180,20 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                 err_lines = "\n\n".join(failed)
                 if mode == "in":
                     guide = (
-                        "📌 *Incoming channel ke liye:*\n"
-                        "Jis channel ke messages forward karne hain, us channel mein *aap (jis number se login kiya) joined hona chahiye.*\n\n"
-                        "Channel join karo → Wapas aao → Dobara select karo"
+                        "💡 *Incoming kaise set kare:*\n"
+                        "Jis channel ke messages copy karne hain, us channel mein *aapka Telegram account (jis number se login kiya) joined hona chahiye.*\n\n"
+                        "✅ Simple fix: Telegram mein wo channel open karo → Join karo → Wapas bot mein aao → Dobara select karo"
                     )
                 else:
                     guide = (
-                        "📌 *Outgoing group ke liye:*\n"
-                        "Jis group mein messages forward karne hain, usme *aapko Admin banana padega.*\n\n"
-                        "Group → Members → Apna number dhundo → Admin banao → Wapas aao → Dobara select karo"
+                        "💡 *Outgoing kaise set kare:*\n"
+                        "Jis group mein messages bhejne hain, usme *aapka Telegram account member hona chahiye* aur *message bhejne ki permission honi chahiye.*\n\n"
+                        "✅ Normal group (jahan sab members post kar sakte hain): Bas join karo\n"
+                        "✅ Restricted group (jahan sirf admins post kar sakte hain): Apne aap ko admin banao\n\n"
+                        "Telegram → Group → Join/Admin set karo → Wapas aao → Dobara select karo"
                     )
                 await cb.message.edit_text(
-                    f"⚠️ *{label} Validation Failed!*\n\n"
+                    f"⚠️ *Ek Chhoti Si Setting Karni Hai!*\n\n"
                     f"{err_lines}\n\n"
                     "━━━━━━━━━━━━━━━\n"
                     f"{guide}",
@@ -1204,6 +1236,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                 await cb.answer("Pehle outgoing channel set karo!", show_alert=True)
                 return
             await db.set_group_active(gid, True)
+            await refresh_cache_for_user(uid)
             dialogs = _get_dialogs(uid)
             name_map = {d[0]: d[1] for d in dialogs}
             in_names = ", ".join(name_map.get(ch.channel_id, str(ch.channel_id)) for ch in in_chs)
@@ -1224,6 +1257,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             if not g or g.user_id != uid:
                 return
             await db.set_group_active(gid, False)
+            await refresh_cache_for_user(uid)
             await cb.message.edit_text(
                 f"⏹ *{g.name}* band ho gaya!",
                 parse_mode="Markdown",
@@ -1235,7 +1269,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             g = await db.get_group(gid)
             if not g or g.user_id != uid:
                 return
-            user_state[uid] = {"action": "rename", "group_id": gid}
+            user_state[uid] = {"action": "rename", "group_id": gid, "ts": datetime.utcnow().timestamp()}
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
             kb = InlineKeyboardMarkup()
             kb.add(InlineKeyboardButton("❌ Cancel", callback_data="grp:" + str(gid)))
@@ -1260,8 +1294,14 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             gid = int(data[4:])
             g = await db.get_group(gid)
             if not g or g.user_id != uid:
+                await cb.answer("Group nahi mila!", show_alert=True)
                 return
-            await db.delete_group(gid)
+            try:
+                await db.delete_group(gid)
+            except Exception as e:
+                await cb.answer(f"Delete fail hua: {e}", show_alert=True)
+                return
+            await refresh_cache_for_user(uid)
             groups = await _groups_to_dict(uid)
             if not groups:
                 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -1287,10 +1327,17 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                 if any(ch.type == "incoming" for ch in g.channels) and any(ch.type == "outgoing" for ch in g.channels):
                     await db.set_group_active(g.id, True)
                     count += 1
+            await refresh_cache_for_user(uid)
             await cb.answer(f"▶️ {count} groups start ho gaye!", show_alert=True)
+            return
 
         elif data == "xa":
             await db.set_group_active_for_user(uid, False)
+            await refresh_cache_for_user(uid)
             await cb.answer("⏹ Sab groups band ho gaye!", show_alert=True)
+            return
 
-        await cb.answer()
+        try:
+            await cb.answer()
+        except Exception:
+            pass
