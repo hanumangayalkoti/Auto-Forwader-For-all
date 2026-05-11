@@ -14,6 +14,10 @@ FERNET_KEY = os.getenv("FERNET_KEY", "").encode() if os.getenv("FERNET_KEY") els
 WEBHOOK_PORT = int(os.getenv("PORT", "8080"))
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
 
+# FIX: BACKUP_BOT_TOKEN add kiya — backup_bot.py import karta tha lekin
+# config.py mein define nahi tha, jisse ImportError aata tha
+BACKUP_BOT_TOKEN = os.getenv("BACKUP_BOT_TOKEN", "")
+
 MAX_GROUPS = 5
 TRIAL_DAYS = 7
 SUBSCRIPTION_PRICE = 6900
