@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import logging
 
 import razorpay
 from aiohttp import web
@@ -8,9 +9,10 @@ from aiohttp import web
 from config import RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET, SUBSCRIPTION_PRICE, SUBSCRIPTION_DAYS
 from database import create_payment, confirm_payment, extend_subscription
 
+logger = logging.getLogger(__name__)
+
 rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
-# Will be set from main.py after bot is ready
 bot_instance = None
 
 
@@ -41,18 +43,36 @@ async def create_order(user_id: int) -> tuple[str, str]:
     return order_id, link_url
 
 
+# FIX: Security Bug — agar RAZORPAY_WEBHOOK_SECRET set nahi hai toh
+# pehle True return hota tha, matlab koi bhi fake payment bhej sakta tha.
+# Ab agar secret missing hai toh False return hoga aur webhook reject hoga.
 def _verify_signature(body: bytes, signature: str) -> bool:
     if not RAZORPAY_WEBHOOK_SECRET:
-        return True
-    mac = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), body, hashlib.sha256)
-    return hmac.compare_digest(mac.hexdigest(), signature)
+        logger.error(
+            "[Payments] RAZORPAY_WEBHOOK_SECRET environment variable set nahi hai! "
+            "Webhook reject ho raha hai — please secret set karo Railway/Railway dashboard mein."
+        )
+        return False
+    if not signature:
+        logger.warning("[Payments] Webhook received bina signature ke — reject kar rahe hain.")
+        return False
+    expected = hmac.new(
+        RAZORPAY_WEBHOOK_SECRET.encode(),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
 
 
 async def webhook_handler(request: web.Request) -> web.Response:
     body = await request.read()
     signature = request.headers.get("X-Razorpay-Signature", "")
 
+    # FIX: Agar signature verify nahi hoti toh 200 ok return karo
+    # (Razorpay retry nahi karta agar non-200 mile, isliye 200 safe hai)
+    # lekin payment process mat karo
     if not _verify_signature(body, signature):
+        logger.warning("[Payments] Webhook signature invalid — ignoring.")
         return web.Response(status=200, text="ok")
 
     try:
@@ -76,6 +96,10 @@ async def webhook_handler(request: web.Request) -> web.Response:
             notes = payload.get("notes", {})
             order_id = notes.get("order_id", "")
 
+        if not order_id:
+            logger.warning(f"[Payments] order_id nahi mila event={event} mein — skip kar rahe hain.")
+            return web.Response(status=200, text="ok")
+
         uid = await confirm_payment(order_id, payment_id)
         if uid:
             await extend_subscription(uid, SUBSCRIPTION_DAYS)
@@ -89,7 +113,7 @@ async def webhook_handler(request: web.Request) -> web.Response:
                     parse_mode="Markdown",
                 )
     except Exception as err:
-        print(f"[Webhook Error] {err}")
+        logger.exception(f"[Webhook Error] {err}")
 
     return web.Response(status=200, text="ok")
 
