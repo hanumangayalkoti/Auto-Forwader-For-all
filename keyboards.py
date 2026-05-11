@@ -19,7 +19,7 @@ def kb_main():
     )
     kb.add(
         InlineKeyboardButton("✏️ Rename Group", callback_data="rename_prompt"),
-        InlineKeyboardButton("📊 Group Status", callback_data="st"),
+        InlineKeyboardButton("📊 Status", callback_data="st"),
     )
     kb.add(InlineKeyboardButton("💳 Subscribe / Renew", callback_data="subscribe"))
     return kb
