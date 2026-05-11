@@ -284,10 +284,20 @@ async def set_group_active(group_id: int, active: bool):
         await s.commit()
 
 
+# FIX: Group Delete Bug — pehle channels delete karo ORM se taaki FK constraint na tute
+# Raw bulk DELETE bypass karta hai ORM cascade, isliye channels automatically delete nahi hote
+# Ab hum group ko ORM se load karke delete karte hain — cascade="all, delete-orphan" fire hoga
 async def delete_group(group_id: int):
     async with AsyncSessionLocal() as s:
-        await s.execute(delete(ForwardingGroup).where(ForwardingGroup.id == group_id))
-        await s.commit()
+        result = await s.execute(
+            select(ForwardingGroup)
+            .where(ForwardingGroup.id == group_id)
+            .options(selectinload(ForwardingGroup.channels))
+        )
+        g = result.scalar_one_or_none()
+        if g:
+            await s.delete(g)
+            await s.commit()
 
 
 async def set_group_active_for_user(user_id: int, active: bool):
