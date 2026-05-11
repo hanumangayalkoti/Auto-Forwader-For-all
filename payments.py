@@ -2,16 +2,32 @@ import hashlib
 import hmac
 import json
 import logging
+import uuid
 
-import razorpay
+import aiohttp
 from aiohttp import web
 
-from config import RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET, SUBSCRIPTION_PRICE, SUBSCRIPTION_DAYS
+from config import (
+    CASHFREE_APP_ID, CASHFREE_SECRET_KEY, CASHFREE_ENV,
+    CASHFREE_WEBHOOK_SECRET, SUBSCRIPTION_PRICE, SUBSCRIPTION_DAYS
+)
 from database import create_payment, confirm_payment, extend_subscription
 
 logger = logging.getLogger(__name__)
 
-rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+# Cashfree API base URL — TEST ya PROD ke hisaab se
+def _base_url() -> str:
+    if CASHFREE_ENV == "PROD":
+        return "https://api.cashfree.com/pg"
+    return "https://sandbox.cashfree.com/pg"
+
+def _headers() -> dict:
+    return {
+        "x-client-id": CASHFREE_APP_ID,
+        "x-client-secret": CASHFREE_SECRET_KEY,
+        "x-api-version": "2023-08-01",
+        "Content-Type": "application/json",
+    }
 
 bot_instance = None
 
@@ -22,43 +38,63 @@ def set_bot(bot):
 
 
 async def create_order(user_id: int) -> tuple[str, str]:
-    order = rzp_client.order.create({
-        "amount": SUBSCRIPTION_PRICE,
-        "currency": "INR",
-        "notes": {"user_id": str(user_id)},
-    })
-    order_id = order["id"]
-    await create_payment(user_id, order_id, SUBSCRIPTION_PRICE)
-    payment_link = rzp_client.payment_link.create({
-        "amount": SUBSCRIPTION_PRICE,
-        "currency": "INR",
-        "description": "DealsKoti Bot — 30 din ka access",
-        "notes": {"user_id": str(user_id), "order_id": order_id},
-        "notify": {"sms": False, "email": False},
-        "reminder_enable": False,
-        "callback_url": "",
-        "callback_method": "get",
-    })
-    link_url = payment_link.get("short_url", "")
+    link_id = f"user_{user_id}_{uuid.uuid4().hex[:8]}"
+
+    payload = {
+        "link_id": link_id,
+        "link_amount": SUBSCRIPTION_PRICE,
+        "link_currency": "INR",
+        "link_purpose": "DealsKoti Bot — 30 din ka access",
+        "customer_details": {
+            "customer_phone": "9999999999",  # Cashfree requires this field
+            "customer_name": f"User {user_id}",
+        },
+        "link_notify": {
+            "send_sms": False,
+            "send_email": False,
+        },
+        "link_meta": {
+            "upi_intent": False,
+        },
+        "link_notes": {
+            "user_id": str(user_id),
+        },
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{_base_url()}/links",
+            headers=_headers(),
+            json=payload,
+        ) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                logger.error(f"[Cashfree] Link create failed: {data}")
+                raise Exception(f"Cashfree link create error: {data}")
+
+    link_url = data.get("link_url", "")
+    order_id = link_id  # link_id as order reference
+
+    await create_payment(user_id, order_id, int(SUBSCRIPTION_PRICE * 100))  # DB mein paise store karo
     return order_id, link_url
 
 
-# FIX: Security Bug — agar RAZORPAY_WEBHOOK_SECRET set nahi hai toh
-# pehle True return hota tha, matlab koi bhi fake payment bhej sakta tha.
-# Ab agar secret missing hai toh False return hoga aur webhook reject hoga.
-def _verify_signature(body: bytes, signature: str) -> bool:
-    if not RAZORPAY_WEBHOOK_SECRET:
+def _verify_signature(body: bytes, timestamp: str, signature: str) -> bool:
+    if not CASHFREE_WEBHOOK_SECRET:
         logger.error(
-            "[Payments] RAZORPAY_WEBHOOK_SECRET environment variable set nahi hai! "
-            "Webhook reject ho raha hai — please secret set karo Railway/Railway dashboard mein."
+            "[Payments] CASHFREE_WEBHOOK_SECRET environment variable set nahi hai! "
+            "Webhook reject ho raha hai — Railway dashboard mein secret set karo."
         )
         return False
-    if not signature:
-        logger.warning("[Payments] Webhook received bina signature ke — reject kar rahe hain.")
+    if not signature or not timestamp:
+        logger.warning("[Payments] Webhook received bina signature/timestamp ke — reject kar rahe hain.")
         return False
+
+    # Cashfree signature = HMAC-SHA256(timestamp + raw_body, secret)
+    message = timestamp.encode() + body
     expected = hmac.new(
-        RAZORPAY_WEBHOOK_SECRET.encode(),
-        body,
+        CASHFREE_WEBHOOK_SECRET.encode(),
+        message,
         hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
@@ -66,12 +102,10 @@ def _verify_signature(body: bytes, signature: str) -> bool:
 
 async def webhook_handler(request: web.Request) -> web.Response:
     body = await request.read()
-    signature = request.headers.get("X-Razorpay-Signature", "")
+    timestamp = request.headers.get("x-webhook-timestamp", "")
+    signature = request.headers.get("x-webhook-signature", "")
 
-    # FIX: Agar signature verify nahi hoti toh 200 ok return karo
-    # (Razorpay retry nahi karta agar non-200 mile, isliye 200 safe hai)
-    # lekin payment process mat karo
-    if not _verify_signature(body, signature):
+    if not _verify_signature(body, timestamp, signature):
         logger.warning("[Payments] Webhook signature invalid — ignoring.")
         return web.Response(status=200, text="ok")
 
@@ -80,27 +114,34 @@ async def webhook_handler(request: web.Request) -> web.Response:
     except Exception:
         return web.Response(status=200, text="ok")
 
-    event = data.get("event", "")
-    if event not in ("payment.captured", "payment_link.paid"):
+    event = data.get("type", "")
+
+    # Cashfree events: PAYMENT_SUCCESS_WEBHOOK, PAYMENT_LINK_EVENT
+    if event not in ("PAYMENT_SUCCESS_WEBHOOK", "PAYMENT_LINK_EVENT"):
         return web.Response(status=200, text="ok")
 
     try:
-        if event == "payment.captured":
-            payload = data["payload"]["payment"]["entity"]
-            payment_id = payload["id"]
-            order_id = payload.get("order_id", "")
-            notes = payload.get("notes", {})
-        else:
-            payload = data["payload"]["payment_link"]["entity"]
-            payment_id = data["payload"].get("payment", {}).get("entity", {}).get("id", "")
-            notes = payload.get("notes", {})
-            order_id = notes.get("order_id", "")
+        payment_data = data.get("data", {})
+        payment = payment_data.get("payment", {})
+        link = payment_data.get("link", {})
 
-        if not order_id:
-            logger.warning(f"[Payments] order_id nahi mila event={event} mein — skip kar rahe hain.")
+        payment_id = payment.get("cf_payment_id", "")
+        payment_status = payment.get("payment_status", "")
+
+        # Link se notes/user_id nikalo
+        notes = link.get("link_notes", {})
+        user_id_str = notes.get("user_id", "")
+        order_id = link.get("link_id", "")
+
+        if payment_status != "SUCCESS":
+            logger.info(f"[Payments] Payment status '{payment_status}' — ignoring.")
             return web.Response(status=200, text="ok")
 
-        uid = await confirm_payment(order_id, payment_id)
+        if not order_id or not user_id_str:
+            logger.warning(f"[Payments] order_id ya user_id nahi mila — skip.")
+            return web.Response(status=200, text="ok")
+
+        uid = await confirm_payment(order_id, str(payment_id))
         if uid:
             await extend_subscription(uid, SUBSCRIPTION_DAYS)
             if bot_instance:
