@@ -289,6 +289,80 @@ async def startup_connect_all():
     logger.info(f"[Forwarder] Connected {ok}/{len(sessions)} users.")
 
 
+async def reconnect_all_disconnected() -> dict:
+    """
+    Har 10 minute mein scheduler call karta hai ye function.
+    Saare saved sessions check karta hai — jo drop ho gaye hain unhe silently reconnect karta hai.
+    Railway restart ya network drop ke baad bhi forwarding automatic resume ho jaati hai.
+
+    Returns: {"checked": N, "ok": N, "reconnected": N, "failed": N}
+    """
+    sessions = await get_all_sessions()
+    stats = {"checked": len(sessions), "ok": 0, "reconnected": 0, "failed": 0}
+
+    for uid, session_string in sessions:
+        client = user_clients.get(uid)
+
+        # Check karo client connected aur authorized hai ya nahi
+        still_alive = False
+        if client:
+            try:
+                if not client.is_connected():
+                    await client.connect()
+                still_alive = await client.is_user_authorized()
+            except Exception:
+                still_alive = False
+
+        if still_alive:
+            # Sab theek hai — sirf cache refresh karo agar khaali hai
+            if uid not in _group_cache:
+                await _refresh_group_cache(uid)
+            stats["ok"] += 1
+            continue
+
+        # Client dead hai — purana close karo
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            user_clients.pop(uid, None)
+            _group_cache.pop(uid, None)
+
+        # Saved session se dobara connect karo
+        logger.info(f"[Reconnect] user={uid} reconnecting...")
+        try:
+            success = await connect_user(uid, session_string)
+            if success:
+                stats["reconnected"] += 1
+                logger.info(f"[Reconnect] user={uid} reconnected successfully.")
+                # User ko notify karo agar unke active groups the
+                if _group_cache.get(uid):
+                    if _bot_ref:
+                        try:
+                            await _bot_ref.send_message(
+                                uid,
+                                "🔄 *Forwarding Reconnected*\n\n"
+                                "Connection drop hone ke baad automatically reconnect ho gaya.\n"
+                                "Forwarding phir se chal rahi hai!",
+                                parse_mode="Markdown",
+                            )
+                        except Exception:
+                            pass
+            else:
+                stats["failed"] += 1
+                logger.warning(f"[Reconnect] user={uid} reconnect failed — session may be expired.")
+        except Exception as err:
+            stats["failed"] += 1
+            logger.error(f"[Reconnect] user={uid} error: {err}")
+
+    logger.info(
+        f"[Reconnect] Done — checked={stats['checked']} ok={stats['ok']} "
+        f"reconnected={stats['reconnected']} failed={stats['failed']}"
+    )
+    return stats
+
+
 async def stop_all_for_user(uid: int):
     await set_group_active_for_user(uid, False)
     _group_cache.pop(uid, None)
@@ -346,13 +420,27 @@ async def check_can_post(uid: int, channel_id: int) -> tuple[bool, str]:
 
         if isinstance(entity, TLChannel):
             if entity.broadcast:
-                # FIX: Broadcast channel — need post_messages admin right
-                # Pehle membership check karo, phir permission check karo
+                # FIX: Creator ka check pehle karo — Telethon creator ke liye
+                # ChannelParticipantCreator return karta hai jisme post_messages
+                # explicitly nahi hota, isliye getattr default False deta tha.
+                # Agar entity.creator=True hai matlab ye account channel ka owner hai —
+                # usse sabhi permissions hain, check karne ki zaroorat nahi.
+                if getattr(entity, 'creator', False):
+                    return True, name
+
+                # Admin rights entity pe directly check karo
+                admin_rights = getattr(entity, 'admin_rights', None)
+                if admin_rights and getattr(admin_rights, 'post_messages', False):
+                    return True, name
+
+                # Non-owner admin ke liye permissions check karo
                 perms = await client.get_permissions(entity)
                 if not getattr(perms, 'post_messages', False):
                     return False, f"no_permission_channel:{name}"
             else:
-                # Supergroup — send_messages check karo
+                # Supergroup — creator check pehle, phir send_messages
+                if getattr(entity, 'creator', False):
+                    return True, name
                 perms = await client.get_permissions(entity)
                 if not getattr(perms, 'send_messages', True):
                     return False, f"no_permission:{name}"
