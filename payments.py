@@ -117,7 +117,7 @@ async def webhook_handler(request: web.Request) -> web.Response:
     event = data.get("type", "")
 
     # Cashfree events: PAYMENT_SUCCESS_WEBHOOK, PAYMENT_LINK_EVENT
-    if event not in ("PAYMENT_SUCCESS_WEBHOOK", "PAYMENT_LINK_EVENT"):
+    if "SUCCESS" not in event.upper() and "PAYMENT_LINK" not in event.upper():
         return web.Response(status=200, text="ok")
 
     try:
