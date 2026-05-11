@@ -1,5 +1,6 @@
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from database import (
     get_users_expiring_in_days,
@@ -90,12 +91,28 @@ async def run_daily_check():
     print("[Scheduler] Daily check complete.")
 
 
+# NEW: Har 10 minute mein drop hue sessions ko reconnect karta hai
+async def run_session_reconnect():
+    from forwarder import reconnect_all_disconnected
+    try:
+        await reconnect_all_disconnected()
+    except Exception as err:
+        print(f"[Scheduler] Session reconnect failed: {err}")
+
+
 def start_scheduler():
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         run_daily_check,
         CronTrigger(hour=4, minute=30),  # 10:00 AM IST = 04:30 UTC
         id="daily_check",
+        replace_existing=True,
+    )
+    # NEW: Auto-reconnect dropped Telethon sessions — har 10 minute mein
+    scheduler.add_job(
+        run_session_reconnect,
+        IntervalTrigger(minutes=10),
+        id="session_reconnect",
         replace_existing=True,
     )
     scheduler.start()
