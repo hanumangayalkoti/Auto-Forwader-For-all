@@ -6,7 +6,7 @@ from aiohttp import web
 
 from config import BOT_TOKEN, WEBHOOK_PORT
 from database import init_db
-from forwarder import startup_connect_all
+from forwarder import startup_connect_all, set_bot as forwarder_set_bot
 from payments import create_webhook_app, set_bot as payments_set_bot
 from scheduler import start_scheduler, set_bot as scheduler_set_bot
 from admin import register_admin
@@ -17,6 +17,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 bot = Bot(token=BOT_TOKEN, parse_mode="Markdown")
 dp = Dispatcher(bot)
 
+# FIX: register_admin ko bot pass karna zaroori hai — pehle sirf dp pass hota tha
+# jisse admin.py mein bot reference missing tha aur /give, /ban ke baad notification nahi jata tha
 register_admin(dp, bot)
 register_handlers(dp, bot)
 
@@ -39,6 +41,10 @@ async def main():
 
     payments_set_bot(bot)
     scheduler_set_bot(bot)
+
+    # FIX: Forwarder ko bhi bot reference do taaki forward errors pe user ko notify kar sake
+    forwarder_set_bot(bot)
+
     start_scheduler()
 
     await run_webhook_server()
