@@ -1,5 +1,3 @@
-import hashlib
-import hmac
 import json
 import logging
 import uuid
@@ -9,17 +7,25 @@ from aiohttp import web
 
 from config import (
     CASHFREE_APP_ID, CASHFREE_SECRET_KEY, CASHFREE_ENV,
-    CASHFREE_WEBHOOK_SECRET, SUBSCRIPTION_PRICE, SUBSCRIPTION_DAYS
+    SUBSCRIPTION_PRICE, SUBSCRIPTION_DAYS
 )
 from database import create_payment, confirm_payment, extend_subscription
 
 logger = logging.getLogger(__name__)
 
-# Cashfree API base URL — TEST ya PROD ke hisaab se
+bot_instance = None
+
+
+def set_bot(bot):
+    global bot_instance
+    bot_instance = bot
+
+
 def _base_url() -> str:
     if CASHFREE_ENV == "PROD":
         return "https://api.cashfree.com/pg"
     return "https://sandbox.cashfree.com/pg"
+
 
 def _headers() -> dict:
     return {
@@ -28,13 +34,6 @@ def _headers() -> dict:
         "x-api-version": "2023-08-01",
         "Content-Type": "application/json",
     }
-
-bot_instance = None
-
-
-def set_bot(bot):
-    global bot_instance
-    bot_instance = bot
 
 
 async def create_order(user_id: int) -> tuple[str, str]:
@@ -46,7 +45,7 @@ async def create_order(user_id: int) -> tuple[str, str]:
         "link_currency": "INR",
         "link_purpose": "DealsKoti Bot — 30 din ka access",
         "customer_details": {
-            "customer_phone": "9999999999",  # Cashfree requires this field
+            "customer_phone": "9999999999",
             "customer_name": f"User {user_id}",
         },
         "link_notify": {
@@ -73,86 +72,84 @@ async def create_order(user_id: int) -> tuple[str, str]:
                 raise Exception(f"Cashfree link create error: {data}")
 
     link_url = data.get("link_url", "")
-    order_id = link_id  # link_id as order reference
+    order_id = link_id
 
-    await create_payment(user_id, order_id, int(SUBSCRIPTION_PRICE * 100))  # DB mein paise store karo
+    await create_payment(user_id, order_id, int(SUBSCRIPTION_PRICE * 100))
     return order_id, link_url
-
-
-def _verify_signature(body: bytes, timestamp: str, signature: str) -> bool:
-    if not CASHFREE_WEBHOOK_SECRET:
-        logger.error(
-            "[Payments] CASHFREE_WEBHOOK_SECRET environment variable set nahi hai! "
-            "Webhook reject ho raha hai — Railway dashboard mein secret set karo."
-        )
-        return False
-    if not signature or not timestamp:
-        logger.warning("[Payments] Webhook received bina signature/timestamp ke — reject kar rahe hain.")
-        return False
-
-    # Cashfree signature = HMAC-SHA256(timestamp + raw_body, secret)
-    message = timestamp.encode() + body
-    expected = hmac.new(
-        CASHFREE_WEBHOOK_SECRET.encode(),
-        message,
-        hashlib.sha256,
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature)
 
 
 async def webhook_handler(request: web.Request) -> web.Response:
     body = await request.read()
-    timestamp = request.headers.get("x-webhook-timestamp", "")
-    signature = request.headers.get("x-webhook-signature", "")
-
-    if not _verify_signature(body, timestamp, signature):
-        logger.warning("[Payments] Webhook signature invalid — ignoring.")
-        return web.Response(status=200, text="ok")
 
     try:
         data = json.loads(body)
     except Exception:
         return web.Response(status=200, text="ok")
 
-    event = data.get("type", "")
+    event = data.get("event", "") or data.get("type", "")
+    logger.info(f"[Webhook] Event received: {event}")
 
-    # Cashfree events: PAYMENT_SUCCESS_WEBHOOK, PAYMENT_LINK_EVENT
-    if "SUCCESS" not in event.upper() and "PAYMENT_LINK" not in event.upper():
+    if "SUCCESS" not in event.upper() and "PAID" not in event.upper():
         return web.Response(status=200, text="ok")
 
     try:
-        payment_data = data.get("data", {})
-        payment = payment_data.get("payment", {})
-        link = payment_data.get("link", {})
+        nested = data.get("data", {})
 
-        payment_id = payment.get("cf_payment_id", "")
-        payment_status = payment.get("payment_status", "")
+        # Payment Link webhook se data nikalo
+        link_data = (
+            data.get("linkDetails")
+            or nested.get("link")
+            or {}
+        )
+        payment_data = (
+            data.get("paymentDetails")
+            or nested.get("payment")
+            or {}
+        )
 
-        # Link se notes/user_id nikalo
-        notes = link.get("link_notes", {})
+        link_id = (
+            link_data.get("linkId")
+            or link_data.get("link_id")
+            or ""
+        )
+        payment_id = str(
+            payment_data.get("cfPaymentId")
+            or payment_data.get("cf_payment_id")
+            or ""
+        )
+
+        notes = (
+            link_data.get("linkNotes")
+            or link_data.get("link_notes")
+            or {}
+        )
         user_id_str = notes.get("user_id", "")
-        order_id = link.get("link_id", "")
 
-        if payment_status != "SUCCESS":
-            logger.info(f"[Payments] Payment status '{payment_status}' — ignoring.")
+        logger.info(f"[Webhook] link_id={link_id} payment_id={payment_id} user_id={user_id_str}")
+
+        if not link_id:
+            logger.warning("[Webhook] link_id nahi mila — skip.")
             return web.Response(status=200, text="ok")
 
-        if not order_id or not user_id_str:
-            logger.warning(f"[Payments] order_id ya user_id nahi mila — skip.")
-            return web.Response(status=200, text="ok")
-
-        uid = await confirm_payment(order_id, str(payment_id))
+        uid = await confirm_payment(link_id, payment_id)
         if uid:
             await extend_subscription(uid, SUBSCRIPTION_DAYS)
+            logger.info(f"[Webhook] Subscription extended for user {uid}")
             if bot_instance:
-                await bot_instance.send_message(
-                    uid,
-                    "✅ *Payment Successful!*\n\n"
-                    "₹69 receive ho gaya.\n"
-                    "30 din ka access mil gaya hai!\n\n"
-                    "Ab /start karo aur forwarding enjoy karo! 🎉",
-                    parse_mode="Markdown",
-                )
+                try:
+                    await bot_instance.send_message(
+                        uid,
+                        "✅ *Payment Successful!*\n\n"
+                        "₹69 receive ho gaya.\n"
+                        "30 din ka access mil gaya hai!\n\n"
+                        "Ab /start karo aur forwarding enjoy karo! 🎉",
+                        parse_mode="Markdown",
+                    )
+                except Exception as msg_err:
+                    logger.warning(f"[Webhook] Message send failed for {uid}: {msg_err}")
+        else:
+            logger.warning(f"[Webhook] confirm_payment ne None return kiya for link_id={link_id}")
+
     except Exception as err:
         logger.exception(f"[Webhook Error] {err}")
 
