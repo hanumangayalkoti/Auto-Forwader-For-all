@@ -1,12 +1,14 @@
+import asyncio
+import hashlib
+import hmac
 import json
 import logging
-import uuid
 
-import aiohttp
+import razorpay
 from aiohttp import web
 
 from config import (
-    CASHFREE_APP_ID, CASHFREE_SECRET_KEY, CASHFREE_ENV,
+    RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET,
     SUBSCRIPTION_PRICE, SUBSCRIPTION_DAYS
 )
 from database import create_payment, confirm_payment, extend_subscription
@@ -21,110 +23,85 @@ def set_bot(bot):
     bot_instance = bot
 
 
-def _base_url() -> str:
-    if CASHFREE_ENV == "PROD":
-        return "https://api.cashfree.com/pg"
-    return "https://sandbox.cashfree.com/pg"
-
-
-def _headers() -> dict:
-    return {
-        "x-client-id": CASHFREE_APP_ID,
-        "x-client-secret": CASHFREE_SECRET_KEY,
-        "x-api-version": "2023-08-01",
-        "Content-Type": "application/json",
-    }
+def _get_client() -> razorpay.Client:
+    return razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
 
 async def create_order(user_id: int) -> tuple[str, str]:
-    link_id = f"user_{user_id}_{uuid.uuid4().hex[:8]}"
+    amount_paise = int(SUBSCRIPTION_PRICE * 100)  # Razorpay paise mein leta hai
 
     payload = {
-        "link_id": link_id,
-        "link_amount": SUBSCRIPTION_PRICE,
-        "link_currency": "INR",
-        "link_purpose": "DealsKoti Bot — 30 din ka access",
-        "customer_details": {
-            "customer_phone": "9999999999",
-            "customer_name": f"User {user_id}",
+        "amount": amount_paise,
+        "currency": "INR",
+        "description": "DealsKoti Bot — 30 din ka access",
+        "customer": {
+            "name": f"User {user_id}",
         },
-        "link_notify": {
-            "send_sms": False,
-            "send_email": False,
-        },
-        "link_meta": {
-            "upi_intent": False,
-        },
-        "link_notes": {
+        "notes": {
             "user_id": str(user_id),
         },
+        "reminder_enable": False,
     }
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"{_base_url()}/links",
-            headers=_headers(),
-            json=payload,
-        ) as resp:
-            data = await resp.json()
-            if resp.status != 200:
-                logger.error(f"[Cashfree] Link create failed: {data}")
-                raise Exception(f"Cashfree link create error: {data}")
+    client = _get_client()
+    data = await asyncio.to_thread(client.payment_link.create, payload)
 
-    link_url = data.get("link_url", "")
-    order_id = link_id
+    link_id = data.get("id", "")
+    link_url = data.get("short_url", "")
 
-    await create_payment(user_id, order_id, int(SUBSCRIPTION_PRICE * 100))
-    return order_id, link_url
+    if not link_id:
+        logger.error(f"[Razorpay] Payment link create failed: {data}")
+        raise Exception(f"Razorpay link create error: {data}")
+
+    await create_payment(user_id, link_id, amount_paise)
+    return link_id, link_url
 
 
 async def webhook_handler(request: web.Request) -> web.Response:
     body = await request.read()
+
+    # Signature verify karo
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    if RAZORPAY_WEBHOOK_SECRET and signature:
+        expected = hmac.new(
+            RAZORPAY_WEBHOOK_SECRET.encode(),
+            body,
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            logger.warning("[Webhook] Invalid signature — request reject.")
+            return web.Response(status=200, text="ok")
 
     try:
         data = json.loads(body)
     except Exception:
         return web.Response(status=200, text="ok")
 
-    event = data.get("event", "") or data.get("type", "")
+    event = data.get("event", "")
     logger.info(f"[Webhook] Event received: {event}")
 
-    if "SUCCESS" not in event.upper() and "PAID" not in event.upper():
+    # Sirf ye dono events handle karo
+    if event not in ("payment_link.paid", "payment.captured"):
         return web.Response(status=200, text="ok")
 
     try:
-        nested = data.get("data", {})
+        payload = data.get("payload", {})
 
-        # Payment Link webhook se data nikalo
-        link_data = (
-            data.get("linkDetails")
-            or nested.get("link")
-            or {}
-        )
-        payment_data = (
-            data.get("paymentDetails")
-            or nested.get("payment")
-            or {}
-        )
+        if event == "payment_link.paid":
+            link_entity = payload.get("payment_link", {}).get("entity", {})
+            payment_entity = payload.get("payment", {}).get("entity", {})
+            link_id = link_entity.get("id", "")
+            payment_id = str(payment_entity.get("id", ""))
+            notes = link_entity.get("notes", {})
 
-        link_id = (
-            link_data.get("linkId")
-            or link_data.get("link_id")
-            or ""
-        )
-        payment_id = str(
-            payment_data.get("cfPaymentId")
-            or payment_data.get("cf_payment_id")
-            or ""
-        )
+        else:  # payment.captured
+            payment_entity = payload.get("payment", {}).get("entity", {})
+            payment_id = str(payment_entity.get("id", ""))
+            notes = payment_entity.get("notes", {})
+            # payment.captured mein link_id nahi hota, order_id use karo
+            link_id = str(payment_entity.get("order_id", "") or payment_entity.get("invoice_id", ""))
 
-        notes = (
-            link_data.get("linkNotes")
-            or link_data.get("link_notes")
-            or {}
-        )
         user_id_str = notes.get("user_id", "")
-
         logger.info(f"[Webhook] link_id={link_id} payment_id={payment_id} user_id={user_id_str}")
 
         if not link_id:
