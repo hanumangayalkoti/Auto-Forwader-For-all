@@ -12,13 +12,12 @@ FERNET_KEY = os.getenv("FERNET_KEY", "").encode() if os.getenv("FERNET_KEY") els
 WEBHOOK_PORT = int(os.getenv("PORT", "8080"))
 BACKUP_BOT_TOKEN = os.getenv("BACKUP_BOT_TOKEN", "")
 
-# ===== CASHFREE =====
-CASHFREE_APP_ID = os.getenv("CASHFREE_APP_ID", "")
-CASHFREE_SECRET_KEY = os.getenv("CASHFREE_SECRET_KEY", "")
-CASHFREE_ENV = os.getenv("CASHFREE_ENV", "TEST")  # "TEST" ya "PROD"
-CASHFREE_WEBHOOK_SECRET = os.getenv("CASHFREE_WEBHOOK_SECRET", "")
+# ===== RAZORPAY =====
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
+RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
 
 MAX_GROUPS = 5
 TRIAL_DAYS = 7
-SUBSCRIPTION_PRICE = 69.00   # Cashfree mein rupees mein hota hai (Razorpay wala paise mein tha)
+SUBSCRIPTION_PRICE = 69.00
 SUBSCRIPTION_DAYS = 30
