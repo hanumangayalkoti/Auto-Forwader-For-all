@@ -25,15 +25,18 @@ user_dialogs: dict[int, list[tuple[int, str]]] = {}
 # In-memory active group cache: user_id → [{group_id, incoming_ids, outgoing_ids}]
 _group_cache: dict[int, list[dict]] = {}
 
-# FIX: Bot reference for user error notifications
-# Set karo main.py se taaki forward fail hone pe user ko notify kar sakein
+# Bot reference for user error notifications
 _bot_ref: Optional[object] = None
 
-# Track consecutive failures per (user_id, group_id, target_id) taaki spam na ho
+# Track which clients already have a handler registered (prevents duplicate forwarding)
+_handler_registered: set[int] = set()
+
+# Track consecutive failures per (user_id, group_id, target_id)
 _fail_counts: dict[str, int] = {}
 FAIL_NOTIFY_THRESHOLD = 3
 
-DIALOG_LIMIT = 20
+# FIX: Increased from 20 → 100 so all user channels/groups are visible in setup
+DIALOG_LIMIT = 100
 FORWARD_DELAY = 0.4
 
 
@@ -89,7 +92,6 @@ async def _notify_user_error(uid: int, grp_name: str, tgt_id: int, err_msg: str)
     count = _fail_counts.get(fail_key, 0) + 1
     _fail_counts[fail_key] = count
 
-    # FIX: Sirf threshold hit hone pe notify karo, har baar nahi
     if count == FAIL_NOTIFY_THRESHOLD:
         try:
             await _bot_ref.send_message(
@@ -110,6 +112,12 @@ async def _notify_user_error(uid: int, grp_name: str, tgt_id: int, err_msg: str)
 
 
 def _make_handler(uid: int, client: TelegramClient):
+    # FIX: Duplicate handler prevention — same client pe handler dobara register mat karo
+    client_id = id(client)
+    if client_id in _handler_registered:
+        return
+    _handler_registered.add(client_id)
+
     @client.on(events.NewMessage)
     async def forwarder(event):
         cached = _group_cache.get(uid, [])
@@ -128,14 +136,14 @@ def _make_handler(uid: int, client: TelegramClient):
                     elif m.message:
                         await client.send_message(tgt_id, m.message)
 
-                    # FIX: Success hone pe fail counter reset karo
+                    # Success hone pe fail counter reset karo
                     _fail_counts.pop(fail_key, None)
                     await asyncio.sleep(FORWARD_DELAY)
 
                 except Exception as err:
                     err_str = str(err)
                     if hasattr(err, 'seconds'):
-                        # FloodWait — back off aur retry
+                        # FloodWait — back off
                         wait = err.seconds + 5
                         logger.warning(f"[FloodWait] user={uid} waiting {wait}s")
                         await asyncio.sleep(wait)
@@ -143,7 +151,6 @@ def _make_handler(uid: int, client: TelegramClient):
                         logger.error(
                             f"[Forward Error] user={uid} grp={grp['name']} → {tgt_id}: {err_str}"
                         )
-                        # FIX: User ko meaningful error message bhejo (threshold ke baad)
                         await _notify_user_error(uid, grp["name"], tgt_id, err_str)
 
     return forwarder
@@ -163,14 +170,13 @@ async def load_dialogs(uid: int) -> list[tuple[int, str]]:
             return []
 
     try:
-        all_dialogs = await client.get_dialogs(limit=100)
+        all_dialogs = await client.get_dialogs(limit=DIALOG_LIMIT)
         pinned = [d for d in all_dialogs if d.pinned]
         non_pinned = [d for d in all_dialogs if not d.pinned]
         sorted_dialogs = pinned + non_pinned
-        top_dialogs = sorted_dialogs[:DIALOG_LIMIT]
 
         result = []
-        for d in top_dialogs:
+        for d in sorted_dialogs:
             try:
                 entity = d.entity
                 name = (
@@ -216,8 +222,11 @@ async def connect_user(uid: int, session_string: str) -> bool:
 
 async def create_client_for_login(uid: int) -> TelegramClient:
     if uid in user_clients:
+        old_client = user_clients[uid]
+        # Remove old handler tracking
+        _handler_registered.discard(id(old_client))
         try:
-            await user_clients[uid].disconnect()
+            await old_client.disconnect()
         except Exception:
             pass
     client = TelegramClient(StringSession(), API_ID, API_HASH)
@@ -245,6 +254,7 @@ async def finalize_login(uid: int) -> Optional[str]:
 async def logout_user(uid: int):
     client = user_clients.get(uid)
     if client:
+        _handler_registered.discard(id(client))
         try:
             await client.log_out()
         except Exception:
@@ -293,9 +303,6 @@ async def reconnect_all_disconnected() -> dict:
     """
     Har 10 minute mein scheduler call karta hai ye function.
     Saare saved sessions check karta hai — jo drop ho gaye hain unhe silently reconnect karta hai.
-    Railway restart ya network drop ke baad bhi forwarding automatic resume ho jaati hai.
-
-    Returns: {"checked": N, "ok": N, "reconnected": N, "failed": N}
     """
     sessions = await get_all_sessions()
     stats = {"checked": len(sessions), "ok": 0, "reconnected": 0, "failed": 0}
@@ -303,7 +310,6 @@ async def reconnect_all_disconnected() -> dict:
     for uid, session_string in sessions:
         client = user_clients.get(uid)
 
-        # Check karo client connected aur authorized hai ya nahi
         still_alive = False
         if client:
             try:
@@ -314,14 +320,13 @@ async def reconnect_all_disconnected() -> dict:
                 still_alive = False
 
         if still_alive:
-            # Sab theek hai — sirf cache refresh karo agar khaali hai
             if uid not in _group_cache:
                 await _refresh_group_cache(uid)
             stats["ok"] += 1
             continue
 
-        # Client dead hai — purana close karo
         if client:
+            _handler_registered.discard(id(client))
             try:
                 await client.disconnect()
             except Exception:
@@ -329,14 +334,12 @@ async def reconnect_all_disconnected() -> dict:
             user_clients.pop(uid, None)
             _group_cache.pop(uid, None)
 
-        # Saved session se dobara connect karo
         logger.info(f"[Reconnect] user={uid} reconnecting...")
         try:
             success = await connect_user(uid, session_string)
             if success:
                 stats["reconnected"] += 1
                 logger.info(f"[Reconnect] user={uid} reconnected successfully.")
-                # User ko notify karo agar unke active groups the
                 if _group_cache.get(uid):
                     if _bot_ref:
                         try:
@@ -420,11 +423,7 @@ async def check_can_post(uid: int, channel_id: int) -> tuple[bool, str]:
 
         if isinstance(entity, TLChannel):
             if entity.broadcast:
-                # FIX: Creator ka check pehle karo — Telethon creator ke liye
-                # ChannelParticipantCreator return karta hai jisme post_messages
-                # explicitly nahi hota, isliye getattr default False deta tha.
-                # Agar entity.creator=True hai matlab ye account channel ka owner hai —
-                # usse sabhi permissions hain, check karne ki zaroorat nahi.
+                # Creator ka check pehle karo
                 if getattr(entity, 'creator', False):
                     return True, name
 
@@ -438,14 +437,14 @@ async def check_can_post(uid: int, channel_id: int) -> tuple[bool, str]:
                 if not getattr(perms, 'post_messages', False):
                     return False, f"no_permission_channel:{name}"
             else:
-                # Supergroup — creator check pehle, phir send_messages
+                # Supergroup
                 if getattr(entity, 'creator', False):
                     return True, name
                 perms = await client.get_permissions(entity)
                 if not getattr(perms, 'send_messages', True):
                     return False, f"no_permission:{name}"
         elif isinstance(entity, TLChat):
-            # Regular group — check if kicked/restricted
+            # Regular group
             perms = await client.get_permissions(entity)
             if not getattr(perms, 'send_messages', True):
                 return False, f"no_permission:{name}"
@@ -460,4 +459,6 @@ async def check_can_post(uid: int, channel_id: int) -> tuple[bool, str]:
             return False, f"not_member:{entity_name}"
         if "private" in err.lower() or "access" in err.lower():
             return False, f"not_member:{entity_name}"
+        # FIX: Missing fallback return — bina iske function None return karta tha
+        # jo handlers.py mein "ok, result = await check_can_post(...)" pe crash karta
         return False, f"error:{entity_name}:{err}"
