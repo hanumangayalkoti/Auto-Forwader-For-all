@@ -1,6 +1,7 @@
-import io
+import os
 import asyncio
 import logging
+import tempfile
 from typing import Optional
 
 from telethon import TelegramClient, events
@@ -35,7 +36,6 @@ _handler_registered: set[int] = set()
 _fail_counts: dict[str, int] = {}
 FAIL_NOTIFY_THRESHOLD = 3
 
-# FIX: Increased from 20 → 100 so all user channels/groups are visible in setup
 DIALOG_LIMIT = 100
 FORWARD_DELAY = 0.4
 
@@ -55,20 +55,37 @@ def _normalize_id(entity) -> int:
     return getattr(entity, 'id', 0)
 
 
+# FIX: BytesIO ki jagah temp file use karo — badi files ke liye "file parts invalid" error fix
 async def _copy_with_download(client: TelegramClient, target_id: int, message):
-    buf = io.BytesIO()
-    await message.download_media(file=buf)
-    buf.seek(0)
-    fname = "file"
+    suffix = ""
     if message.file and message.file.name:
-        fname = message.file.name
-    buf.name = fname
-    await client.send_file(
-        target_id,
-        file=buf,
-        caption=message.message or "",
-        force_document=False,
-    )
+        _, suffix = os.path.splitext(message.file.name)
+    if not suffix and message.file and message.file.mime_type:
+        mime_map = {
+            "video/mp4": ".mp4", "video/mpeg": ".mpeg", "video/quicktime": ".mov",
+            "audio/mpeg": ".mp3", "audio/ogg": ".ogg", "audio/flac": ".flac",
+            "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+            "image/webp": ".webp", "application/pdf": ".pdf",
+        }
+        suffix = mime_map.get(message.file.mime_type, "")
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+        await message.download_media(file=tmp_path)
+        await client.send_file(
+            target_id,
+            file=tmp_path,
+            caption=message.message or "",
+            force_document=False,
+        )
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 async def _refresh_group_cache(uid: int):
@@ -112,7 +129,6 @@ async def _notify_user_error(uid: int, grp_name: str, tgt_id: int, err_msg: str)
 
 
 def _make_handler(uid: int, client: TelegramClient):
-    # FIX: Duplicate handler prevention — same client pe handler dobara register mat karo
     client_id = id(client)
     if client_id in _handler_registered:
         return
@@ -128,22 +144,53 @@ def _make_handler(uid: int, client: TelegramClient):
                 fail_key = f"{uid}:{tgt_id}"
                 try:
                     m = event.message
-                    if m.media:
-                        try:
-                            await client.send_file(tgt_id, file=m.media, caption=m.message or "")
-                        except Exception:
-                            await _copy_with_download(client, tgt_id, m)
-                    elif m.message:
-                        await client.send_message(tgt_id, m.message)
 
-                    # Success hone pe fail counter reset karo
-                    _fail_counts.pop(fail_key, None)
+                    # FIX: Forwarding strategy — 3 levels:
+                    # 1. forward_messages() — Telegram ka native forward, sabse reliable
+                    #    koi download/upload nahi, media type kuch bhi ho chalega
+                    # 2. send_file(m.media) — agar forward block ho (e.g. no-forward channel)
+                    # 3. _copy_with_download() — last resort, temp file se (BytesIO wala bug fix)
+
+                    forwarded = False
+
+                    # Level 1: Native forward
+                    try:
+                        await client.forward_messages(tgt_id, m)
+                        forwarded = True
+                    except Exception as fwd_err:
+                        logger.debug(
+                            f"[Forward L1] user={uid} grp={grp['name']} → {tgt_id}: "
+                            f"native forward failed ({fwd_err}), trying L2"
+                        )
+
+                    # Level 2: send_file with media object (text message bhi handle karo)
+                    if not forwarded:
+                        if m.media:
+                            try:
+                                await client.send_file(tgt_id, file=m.media, caption=m.message or "")
+                                forwarded = True
+                            except Exception as sf_err:
+                                logger.debug(
+                                    f"[Forward L2] user={uid} grp={grp['name']} → {tgt_id}: "
+                                    f"send_file failed ({sf_err}), trying L3"
+                                )
+                        elif m.message:
+                            await client.send_message(tgt_id, m.message)
+                            forwarded = True
+
+                    # Level 3: Download to temp file and re-upload
+                    if not forwarded and m.media:
+                        await _copy_with_download(client, tgt_id, m)
+                        forwarded = True
+
+                    if forwarded:
+                        _fail_counts.pop(fail_key, None)
+
                     await asyncio.sleep(FORWARD_DELAY)
 
                 except Exception as err:
                     err_str = str(err)
                     if hasattr(err, 'seconds'):
-                        # FloodWait — back off
                         wait = err.seconds + 5
                         logger.warning(f"[FloodWait] user={uid} waiting {wait}s")
                         await asyncio.sleep(wait)
@@ -223,7 +270,6 @@ async def connect_user(uid: int, session_string: str) -> bool:
 async def create_client_for_login(uid: int) -> TelegramClient:
     if uid in user_clients:
         old_client = user_clients[uid]
-        # Remove old handler tracking
         _handler_registered.discard(id(old_client))
         try:
             await old_client.disconnect()
@@ -300,10 +346,6 @@ async def startup_connect_all():
 
 
 async def reconnect_all_disconnected() -> dict:
-    """
-    Har 10 minute mein scheduler call karta hai ye function.
-    Saare saved sessions check karta hai — jo drop ho gaye hain unhe silently reconnect karta hai.
-    """
     sessions = await get_all_sessions()
     stats = {"checked": len(sessions), "ok": 0, "reconnected": 0, "failed": 0}
 
@@ -423,32 +465,24 @@ async def check_can_post(uid: int, channel_id: int) -> tuple[bool, str]:
 
         if isinstance(entity, TLChannel):
             if entity.broadcast:
-                # Creator ka check pehle karo
                 if getattr(entity, 'creator', False):
                     return True, name
-
-                # Admin rights entity pe directly check karo
                 admin_rights = getattr(entity, 'admin_rights', None)
                 if admin_rights and getattr(admin_rights, 'post_messages', False):
                     return True, name
-
-                # Non-owner admin ke liye permissions check karo
                 perms = await client.get_permissions(entity)
                 if not getattr(perms, 'post_messages', False):
                     return False, f"no_permission_channel:{name}"
             else:
-                # Supergroup
                 if getattr(entity, 'creator', False):
                     return True, name
                 perms = await client.get_permissions(entity)
                 if not getattr(perms, 'send_messages', True):
                     return False, f"no_permission:{name}"
         elif isinstance(entity, TLChat):
-            # Regular group
             perms = await client.get_permissions(entity)
             if not getattr(perms, 'send_messages', True):
                 return False, f"no_permission:{name}"
-        # TLUser (DM) — always allowed
 
         return True, name
 
@@ -459,6 +493,4 @@ async def check_can_post(uid: int, channel_id: int) -> tuple[bool, str]:
             return False, f"not_member:{entity_name}"
         if "private" in err.lower() or "access" in err.lower():
             return False, f"not_member:{entity_name}"
-        # FIX: Missing fallback return — bina iske function None return karta tha
-        # jo handlers.py mein "ok, result = await check_can_post(...)" pe crash karta
         return False, f"error:{entity_name}:{err}"
