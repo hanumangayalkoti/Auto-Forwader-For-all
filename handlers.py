@@ -480,7 +480,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             "*✨ Features:*\n"
             "━━━━━━━━━━━━━━━━━━━\n"
             f"- Max {MAX_GROUPS} groups\n"
-            "- Top 20 channels (pinned pehle)\n"
+            "- Top channels (pinned pehle)\n"
             "- Bina Forwarded tag ke forward\n"
             "- Private channels support\n"
             "- 7 din free trial\n\n"
@@ -529,7 +529,6 @@ def register_handlers(dp: Dispatcher, bot: Bot):
         if uid == OWNER_ID and uid in broadcast_state:
             state = broadcast_state[uid]
             if state["step"] == "waiting_message":
-                # Ignore if owner accidentally typed a command
                 if text.startswith("/"):
                     await msg.answer(
                         "⚠️ Broadcast mein ho. Command type kiya toh /cancel karo pehle.\n"
@@ -724,7 +723,6 @@ def register_handlers(dp: Dispatcher, bot: Bot):
         # RENAME FLOW
         state = user_state.get(uid)
         if state and state.get("action") == "rename":
-            # Auto-expire rename state after 5 minutes
             ts = state.get("ts", 0)
             if datetime.utcnow().timestamp() - ts > 300:
                 user_state.pop(uid, None)
@@ -899,8 +897,8 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                 return
 
         # ---- MAIN MENU ----
-        # Clear rename state on any navigation callback
-        if data not in ("gr:",) and not data.startswith("gr:"):
+        # Clear rename state on any navigation callback (except rename callbacks themselves)
+        if not data.startswith("gr:"):
             user_state.pop(uid, None)
 
         if data == "mm":
@@ -931,7 +929,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                 "2. Incoming channel select → Confirm\n"
                 "3. Outgoing channel select → Confirm\n"
                 "4. Start Forwarding!\n\n"
-                f"Max {MAX_GROUPS} groups | Top 20 channels (pinned pehle)\n"
+                f"Max {MAX_GROUPS} groups | Channels (pinned pehle)\n"
                 "/help se full guide dekho.",
                 parse_mode="Markdown",
                 reply_markup=kb_main_menu_only(),
@@ -963,8 +961,9 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                 return
             if len(groups) == 1:
                 gid = groups[0]["id"]
-                g = await db.get_group(gid)
-                user_state[uid] = {"action": "rename", "group_id": gid}
+                # FIX: "ts" field missing tha — bina ts ke rename state hamesha expired lagta tha
+                # aur user_state immediately pop ho jata tha, rename kabhi hota hi nahi tha
+                user_state[uid] = {"action": "rename", "group_id": gid, "ts": datetime.utcnow().timestamp()}
                 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
                 kb = InlineKeyboardMarkup()
                 kb.add(InlineKeyboardButton("❌ Cancel", callback_data="grp:" + str(gid)))
@@ -1269,6 +1268,7 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             g = await db.get_group(gid)
             if not g or g.user_id != uid:
                 return
+            # FIX: "ts" field zaroor dalo — bina ts ke rename hamesha silently fail hota tha
             user_state[uid] = {"action": "rename", "group_id": gid, "ts": datetime.utcnow().timestamp()}
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
             kb = InlineKeyboardMarkup()
