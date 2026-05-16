@@ -37,6 +37,8 @@ _fail_counts: dict[str, int] = {}
 FAIL_NOTIFY_THRESHOLD = 3
 
 DIALOG_LIMIT = 100
+DIALOG_LIMIT_FALLBACK = 30   # agar 100 fail ho toh ye try karo
+DIALOG_TIMEOUT = 25          # seconds — itne time mein na aaye toh fail
 FORWARD_DELAY = 0.4
 
 
@@ -203,6 +205,41 @@ def _make_handler(uid: int, client: TelegramClient):
     return forwarder
 
 
+async def _fetch_and_parse_dialogs(client: TelegramClient, uid: int, limit: int) -> list[tuple[int, str]]:
+    """Dialogs fetch karo aur parse karo — alag function taaki retry easy ho."""
+    all_dialogs = await asyncio.wait_for(
+        client.get_dialogs(limit=limit),
+        timeout=DIALOG_TIMEOUT,
+    )
+    pinned = [d for d in all_dialogs if d.pinned]
+    non_pinned = [d for d in all_dialogs if not d.pinned]
+    sorted_dialogs = pinned + non_pinned
+
+    result = []
+    for d in sorted_dialogs:
+        try:
+            entity = d.entity
+            name = (
+                getattr(entity, 'title', None)
+                or getattr(entity, 'first_name', None)
+                or d.name
+                or "Unnamed"
+            )
+            chat_id = _normalize_id(entity)
+            if chat_id != 0:
+                pin_mark = "📌 " if d.pinned else ""
+                result.append((chat_id, pin_mark + name))
+        except Exception as e:
+            logger.debug(f"[Dialog Load] user={uid}: Skipping dialog: {e}")
+            continue
+
+    logger.info(
+        f"[Dialog Load] user={uid}: Loaded {len(result)} dialogs "
+        f"(limit={limit}, pinned={len(pinned)})"
+    )
+    return result
+
+
 async def load_dialogs(uid: int) -> list[tuple[int, str]]:
     client = user_clients.get(uid)
     if not client:
@@ -216,37 +253,25 @@ async def load_dialogs(uid: int) -> list[tuple[int, str]]:
             logger.error(f"[Dialog Load] user={uid}: Reconnect failed: {err}")
             return []
 
-    try:
-        all_dialogs = await client.get_dialogs(limit=DIALOG_LIMIT)
-        pinned = [d for d in all_dialogs if d.pinned]
-        non_pinned = [d for d in all_dialogs if not d.pinned]
-        sorted_dialogs = pinned + non_pinned
+    # Pehle DIALOG_LIMIT (100) se try karo, fail ho toh DIALOG_LIMIT_FALLBACK (30) se
+    for limit in (DIALOG_LIMIT, DIALOG_LIMIT_FALLBACK):
+        try:
+            result = await _fetch_and_parse_dialogs(client, uid, limit)
+            user_dialogs[uid] = result
+            return result
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[Dialog Load] user={uid}: get_dialogs(limit={limit}) timeout "
+                f"({DIALOG_TIMEOUT}s). "
+                + ("Retrying with smaller limit..." if limit == DIALOG_LIMIT else "Giving up.")
+            )
+        except Exception as err:
+            logger.error(f"[Dialog Load Error] user={uid} (limit={limit}): {err}")
+            if limit == DIALOG_LIMIT_FALLBACK:
+                break
 
-        result = []
-        for d in sorted_dialogs:
-            try:
-                entity = d.entity
-                name = (
-                    getattr(entity, 'title', None)
-                    or getattr(entity, 'first_name', None)
-                    or d.name
-                    or "Unnamed"
-                )
-                chat_id = _normalize_id(entity)
-                if chat_id != 0:
-                    pin_mark = "📌 " if d.pinned else ""
-                    result.append((chat_id, pin_mark + name))
-            except Exception as e:
-                logger.debug(f"[Dialog Load] user={uid}: Skipping dialog: {e}")
-                continue
-
-        user_dialogs[uid] = result
-        logger.info(f"[Dialog Load] user={uid}: Loaded {len(result)} dialogs (pinned: {len(pinned)})")
-        return result
-
-    except Exception as err:
-        logger.error(f"[Dialog Load Error] user={uid}: {err}")
-        return []
+    # Dono fail — cached value rakhte hain agar kuch tha, warna []
+    return user_dialogs.get(uid, [])
 
 
 async def connect_user(uid: int, session_string: str) -> bool:
