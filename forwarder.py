@@ -242,16 +242,45 @@ async def _fetch_and_parse_dialogs(client: TelegramClient, uid: int, limit: int)
 
 async def load_dialogs(uid: int) -> list[tuple[int, str]]:
     client = user_clients.get(uid)
+
+    # Client nahi mila — DB se session lekar reconnect try karo
     if not client:
-        logger.warning(f"[Dialog Load] user={uid}: No client found")
+        logger.warning(f"[Dialog Load] user={uid}: No client in memory, attempting DB reconnect...")
+        try:
+            session_str = await load_session(uid)
+            if session_str:
+                reconnected = await connect_user(uid, session_str)
+                if reconnected:
+                    # connect_user ke andar load_dialogs already call hoti hai
+                    # toh cached result return karo — dobara load mat karo
+                    cached = user_dialogs.get(uid, [])
+                    logger.info(
+                        f"[Dialog Load] user={uid}: Reconnected from DB. "
+                        f"Dialogs from cache: {len(cached)}"
+                    )
+                    return cached
+                else:
+                    logger.error(
+                        f"[Dialog Load] user={uid}: DB reconnect failed — "
+                        "session expired ya revoked hai. User ko /logout → /login karna hoga."
+                    )
+                    return []
+            else:
+                logger.error(f"[Dialog Load] user={uid}: No session in DB — user ne login nahi kiya.")
+                return []
+        except Exception as reconnect_err:
+            logger.error(f"[Dialog Load] user={uid}: Reconnect exception: {reconnect_err}")
+            return []
+
+    if not client:
         return []
 
     if not client.is_connected():
         try:
             await client.connect()
         except Exception as err:
-            logger.error(f"[Dialog Load] user={uid}: Reconnect failed: {err}")
-            return []
+            logger.error(f"[Dialog Load] user={uid}: Connect failed: {err}")
+            return user_dialogs.get(uid, [])
 
     # Pehle DIALOG_LIMIT (100) se try karo, fail ho toh DIALOG_LIMIT_FALLBACK (30) se
     for limit in (DIALOG_LIMIT, DIALOG_LIMIT_FALLBACK):
