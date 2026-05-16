@@ -28,6 +28,9 @@ login_states: dict[int, dict] = {}
 user_state: dict[int, dict] = {}
 temp_selection: dict[int, dict] = {}
 
+# Max dialogs dikhane ki limit — Telegram 100 buttons se zyada allow nahi karta
+DISPLAY_LIMIT = 50
+
 
 def _access_denied_text(reason: str) -> str:
     if reason == "banned":
@@ -42,6 +45,11 @@ def _access_denied_text(reason: str) -> str:
 
 def _get_dialogs(uid: int) -> list[tuple[int, str]]:
     return user_dialogs.get(uid, [])
+
+
+def _get_dialogs_limited(uid: int) -> list[tuple[int, str]]:
+    """Display ke liye dialogs — Telegram button limit se bachaane ke liye max 50."""
+    return user_dialogs.get(uid, [])[:DISPLAY_LIMIT]
 
 
 def _get_selected(uid: int, gid: int, mode: str) -> set:
@@ -60,7 +68,8 @@ def _clear_selected(uid: int, gid: int, mode: str):
 
 
 def _text_channel_list(uid: int, gid: int, mode: str) -> str:
-    dialogs = _get_dialogs(uid)
+    # FIX: DISPLAY_LIMIT se cap karo — 100+ channels se message too long hota tha
+    dialogs = _get_dialogs_limited(uid)
     selected = _get_selected(uid, gid, mode)
     if not dialogs:
         return "Koi channel/group nahi mila. Pehle /login karo."
@@ -961,8 +970,6 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                 return
             if len(groups) == 1:
                 gid = groups[0]["id"]
-                # FIX: "ts" field missing tha — bina ts ke rename state hamesha expired lagta tha
-                # aur user_state immediately pop ho jata tha, rename kabhi hota hi nahi tha
                 user_state[uid] = {"action": "rename", "group_id": gid, "ts": datetime.utcnow().timestamp()}
                 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
                 kb = InlineKeyboardMarkup()
@@ -1021,16 +1028,17 @@ def register_handlers(dp: Dispatcher, bot: Bot):
                 return
             await cb.answer("Channels load ho rahe hain...")
             await load_dialogs(uid)
-            dialogs = _get_dialogs(uid)
+            # FIX: DISPLAY_LIMIT se cap — 100+ dialogs se Telegram button/message limit exceed hoti thi
+            dialogs = _get_dialogs_limited(uid)
             if not dialogs:
                 await cb.message.edit_text(
-    "⚠️ *Channels Load Nahi Hue*\n\n"
-    "Telegram session disconnect hai.\n\n"
-    "/logout karo phir /login karo dobara.",
-    parse_mode="Markdown",
-    reply_markup=kb_group(gid, g.is_active),
-)
-return
+                    "⚠️ *Channels Load Nahi Hue*\n\n"
+                    "Telegram session disconnect hai.\n\n"
+                    "/logout karo phir /login karo dobara.",
+                    parse_mode="Markdown",
+                    reply_markup=kb_group(gid, g.is_active),
+                )
+                return
             existing = await db.get_channels(gid, "incoming" if mode == "in" else "outgoing")
             selected = {ch.channel_id for ch in existing}
             _set_selected(uid, gid, mode, selected)
@@ -1055,7 +1063,7 @@ return
             g = await db.get_group(gid)
             if not g or g.user_id != uid:
                 return
-            dialogs = _get_dialogs(uid)
+            dialogs = _get_dialogs_limited(uid)
             if 0 <= idx < len(dialogs):
                 did = dialogs[idx][0]
                 selected = _get_selected(uid, gid, mode)
@@ -1083,7 +1091,7 @@ return
             g = await db.get_group(gid)
             if not g or g.user_id != uid:
                 return
-            dialogs = _get_dialogs(uid)
+            dialogs = _get_dialogs_limited(uid)
             selected = {d[0] for d in dialogs}
             _set_selected(uid, gid, mode, selected)
             label = "Incoming" if mode == "in" else "Outgoing"
@@ -1099,7 +1107,7 @@ return
             g = await db.get_group(gid)
             if not g or g.user_id != uid:
                 return
-            dialogs = _get_dialogs(uid)
+            dialogs = _get_dialogs_limited(uid)
             _set_selected(uid, gid, mode, set())
             label = "Incoming" if mode == "in" else "Outgoing"
             await cb.message.edit_text(
@@ -1267,7 +1275,6 @@ return
             g = await db.get_group(gid)
             if not g or g.user_id != uid:
                 return
-            # FIX: "ts" field zaroor dalo — bina ts ke rename hamesha silently fail hota tha
             user_state[uid] = {"action": "rename", "group_id": gid, "ts": datetime.utcnow().timestamp()}
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
             kb = InlineKeyboardMarkup()
