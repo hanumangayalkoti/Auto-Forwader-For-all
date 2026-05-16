@@ -1023,15 +1023,14 @@ def register_handlers(dp: Dispatcher, bot: Bot):
             await load_dialogs(uid)
             dialogs = _get_dialogs(uid)
             if not dialogs:
-                await cb.message.answer(
-                    "⚠️ Koi channel nahi mila!\n\n"
-                    "Possible reasons:\n"
-                    "- Aapke account mein koi channel/group nahi\n"
-                    "- Pehle kuch channels ko pin karo Telegram mein\n\n"
-                    "Telegram mein kisi channel pe jaao → Pin karo → phir wapas aao.",
-                    reply_markup=kb_group(gid, g.is_active),
-                )
-                return
+                await cb.message.edit_text(
+    "⚠️ *Channels Load Nahi Hue*\n\n"
+    "Telegram session disconnect hai.\n\n"
+    "/logout karo phir /login karo dobara.",
+    parse_mode="Markdown",
+    reply_markup=kb_group(gid, g.is_active),
+)
+return
             existing = await db.get_channels(gid, "incoming" if mode == "in" else "outgoing")
             selected = {ch.channel_id for ch in existing}
             _set_selected(uid, gid, mode, selected)
