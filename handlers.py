@@ -1,1347 +1,1461 @@
+"""
+Main bot handlers — all user-facing commands and callbacks.
+"""
 import re
+import logging
 from datetime import datetime
 
 from aiogram import types, Bot
 from aiogram.dispatcher import Dispatcher
 
 import database as db
-from config import MAX_GROUPS, OWNER_ID
+from config import (
+    OWNER_ID, MAIN_BOT_USERNAME, SIMI_BOT_USERNAME,
+    get_plan_limits, has_feature, plan_display_name,
+    AFFILIATE_MIN_WITHDRAW_USD, DISPLAY_LIMIT,
+)
 from forwarder import (
     user_clients, user_dialogs,
     create_client_for_login, finalize_login,
     logout_user, is_user_logged_in,
-    load_dialogs, check_is_member, check_can_post,
-    refresh_cache_for_user,
+    load_dialogs, resolve_channel,
 )
 from keyboards import (
-    kb_login, kb_main, kb_groups, kb_group,
-    kb_channels, kb_after_incoming, kb_after_outgoing,
-    kb_after_start, kb_delete_confirm, kb_status,
-    kb_subscribe, kb_subscribe_only, kb_main_menu_only,
-    kb_logout_confirm, kb_startall_confirm, kb_stopall_confirm,
-    kb_status_menu,
+    kb_main, kb_main_only, kb_login, kb_status_menu,
+    kb_task_list, kb_task, kb_task_delete_confirm,
+    kb_filters, kb_message_settings, kb_advanced_settings,
+    kb_media_filter, kb_plans, kb_plan_billing, kb_payment_link,
+    kb_startall_confirm, kb_stopall_confirm, kb_logout_confirm,
+    kb_refer,
 )
 from payments import create_order
-from admin import broadcast_state
+from admin import broadcast_state, admin_msg_state
 
-login_states: dict[int, dict] = {}
-user_state: dict[int, dict] = {}
-temp_selection: dict[int, dict] = {}
+logger = logging.getLogger(__name__)
 
-# Max dialogs dikhane ki limit — Telegram 100 buttons se zyada allow nahi karta
-DISPLAY_LIMIT = 50
+# ── State dicts ──
+login_states: dict[int, dict] = {}       # user_id → {step, phone, phone_hash, client}
+user_state: dict[int, dict] = {}         # user_id → {action, task_id, ...}
+temp_selection: dict[int, dict] = {}     # channel selection
 
+
+# ──────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────
 
 def _access_denied_text(reason: str) -> str:
     if reason == "banned":
-        return "🚫 Aapka access band kar diya gaya hai. Support se sampark karo."
-    return (
-        "⏰ *Access Khatam Ho Gaya*\n\n"
-        "Tera free trial ya subscription expire ho gaya hai.\n"
-        "Bot use karte rehne ke liye subscribe karo:\n\n"
-        "₹69/month — full access 30 din ke liye!"
-    )
+        return "🚫 Tumhara account band kar diya gaya hai. Support se sampark karo."
+    return "Kuch galat hua. /start karo."
 
 
-def _get_dialogs(uid: int) -> list[tuple[int, str]]:
-    return user_dialogs.get(uid, [])
+def _status_line(user, reason: str) -> str:
+    if "subscribed" in reason:
+        parts = reason.split(":")
+        plan_n = plan_display_name(parts[1]) if len(parts) > 1 else ""
+        days_left = int(parts[2]) if len(parts) > 2 else 0
+        return f"{plan_n} | {days_left} din bache"
+    elif reason == "free":
+        return "🆓 Free Plan"
+    return ""
+
+
+def _plan_days_left(user) -> int:
+    if user.plan_end:
+        delta = (user.plan_end - datetime.utcnow()).days
+        return max(0, delta)
+    return 0
 
 
 def _get_dialogs_limited(uid: int) -> list[tuple[int, str]]:
-    """Display ke liye dialogs — Telegram button limit se bachaane ke liye max 50."""
     return user_dialogs.get(uid, [])[:DISPLAY_LIMIT]
 
 
-def _get_selected(uid: int, gid: int, mode: str) -> set:
-    return temp_selection.get(uid, {}).get(f"{gid}_{mode}", set())
-
-
-def _set_selected(uid: int, gid: int, mode: str, s: set):
-    if uid not in temp_selection:
-        temp_selection[uid] = {}
-    temp_selection[uid][f"{gid}_{mode}"] = s
-
-
-def _clear_selected(uid: int, gid: int, mode: str):
-    if uid in temp_selection:
-        temp_selection[uid].pop(f"{gid}_{mode}", None)
-
-
-def _text_channel_list(uid: int, gid: int, mode: str) -> str:
-    # FIX: DISPLAY_LIMIT se cap karo — 100+ channels se message too long hota tha
-    dialogs = _get_dialogs_limited(uid)
-    selected = _get_selected(uid, gid, mode)
-    if not dialogs:
-        return "Koi channel/group nahi mila. Pehle /login karo."
-    lines = []
-    for i, (did, dn) in enumerate(dialogs):
-        marker = " ✅" if did in selected else ""
-        lines.append(f"{i + 1} - {dn}{marker}")
-    return "\n".join(lines)
-
-
-async def _groups_to_dict(uid: int) -> list[dict]:
-    groups = await db.get_user_groups(uid)
+async def _tasks_to_dict(uid: int) -> list[dict]:
+    tasks = await db.get_user_tasks(uid)
     result = []
-    for g in groups:
-        in_ids = {ch.channel_id for ch in g.channels if ch.type == "incoming"}
-        out_ids = {ch.channel_id for ch in g.channels if ch.type == "outgoing"}
+    for t in tasks:
+        in_ids = {ch.channel_id for ch in t.channels if ch.type == "source"}
+        out_ids = {ch.channel_id for ch in t.channels if ch.type == "target"}
         result.append({
-            "id": g.id,
-            "name": g.name,
-            "active": g.is_active,
-            "incoming": in_ids,
-            "outgoing": out_ids,
+            "id": t.id, "name": t.name, "active": t.is_active,
+            "sources": in_ids, "targets": out_ids,
         })
     return result
 
 
 async def _text_status(uid: int) -> str:
-    groups = await _groups_to_dict(uid)
-    if not groups:
-        return "*Status*\n\nKoi group nahi hai. Manage Groups se banao!"
-    lines = ["*Forwarding Status*\n"]
-    dialogs = _get_dialogs(uid)
+    tasks = await _tasks_to_dict(uid)
+    if not tasks:
+        return "*Status*\n\nKoi task nahi hai. Manage Tasks se banao!"
+    dialogs = user_dialogs.get(uid, [])
     name_map = {d[0]: d[1] for d in dialogs}
-    for g in groups:
-        status = "🟢 Running" if g["active"] else "🔴 Stopped"
-        in_names = ", ".join(name_map.get(d, str(d)) for d in g["incoming"]) or "-"
-        out_names = ", ".join(name_map.get(d, str(d)) for d in g["outgoing"]) or "-"
-        lines.append(f"*{g['name']}* — {status}")
-        lines.append(f"  📥 IN:  {in_names}")
-        lines.append(f"  📤 OUT: {out_names}\n")
+    lines = ["*Forwarding Status*\n"]
+    for t in tasks:
+        status = "🟢 Running" if t["active"] else "🔴 Stopped"
+        in_names = ", ".join(name_map.get(d, str(d)) for d in t["sources"]) or "-"
+        out_names = ", ".join(name_map.get(d, str(d)) for d in t["targets"]) or "-"
+        lines.append(f"*{t['name']}* — {status}")
+        lines.append(f"  📥 Source: {in_names}")
+        lines.append(f"  📤 Target: {out_names}\n")
     return "\n".join(lines)
 
 
-async def _text_group(uid: int, gid: int) -> str:
-    g = await db.get_group(gid)
-    if not g or g.user_id != uid:
-        return "Group nahi mila!"
-    dialogs = _get_dialogs(uid)
-    name_map = {d[0]: d[1] for d in dialogs}
-    in_ids = [ch.channel_id for ch in g.channels if ch.type == "incoming"]
-    out_ids = [ch.channel_id for ch in g.channels if ch.type == "outgoing"]
-    status = "🟢 Running" if g.is_active else "🔴 Stopped"
-    in_list = "\n  ".join("- " + name_map.get(d, str(d)) for d in in_ids) or "  -"
-    out_list = "\n  ".join("- " + name_map.get(d, str(d)) for d in out_ids) or "  -"
-    return (
-        f"*{g.name}*\n\n"
-        f"Status: {status}\n\n"
-        f"Incoming ({len(in_ids)}):\n  {in_list}\n\n"
-        f"Outgoing ({len(out_ids)}):\n  {out_list}"
-    )
-
-
-def _status_line(user, reason: str) -> str:
-    if "subscribed" in reason:
-        now = datetime.utcnow()
-        days_left = (user.sub_end - now).days if user.sub_end else 0
-        return f"✅ Subscription active — {days_left} din bacha"
-    elif "trial" in reason:
-        d = reason.split(":")[1]
-        return f"⏳ Free Trial — {d} din bacha"
-    return ""
-
-
-def _sub_status_text(user, reason: str) -> str:
-    now = datetime.utcnow()
-    if reason == "banned":
+async def _text_sub_status(user, reason: str) -> str:
+    if user.is_banned:
         return "🚫 Account banned hai."
     if "subscribed" in reason:
-        days_left = (user.sub_end - now).days if user.sub_end else 0
-        end_str = user.sub_end.strftime("%d %b %Y") if user.sub_end else "N/A"
+        parts = reason.split(":")
+        plan_n = plan_display_name(parts[1]) if len(parts) > 1 else ""
+        days_left = parts[2] if len(parts) > 2 else "?"
+        end_str = user.plan_end.strftime("%d %b %Y") if user.plan_end else "N/A"
         return (
-            "💳 *Subscription Status*\n\n"
-            f"✅ Active\n"
-            f"Plan: ₹69/month\n"
-            f"Expires: {end_str}\n"
-            f"Din bache: {days_left}"
-        )
-    if "trial" in reason:
-        d = reason.split(":")[1]
-        end_str = user.trial_end.strftime("%d %b %Y") if user.trial_end else "N/A"
-        return (
-            "💳 *Subscription Status*\n\n"
-            f"⏳ Free Trial\n"
-            f"Trial ends: {end_str}\n"
-            f"Din bache: {d}\n\n"
-            "Subscribe karo full access ke liye!"
+            f"💳 *Subscription Status*\n\n"
+            f"✅ Active\nPlan: {plan_n}\n"
+            f"Expires: {end_str}\nDin bache: {days_left}"
         )
     return (
         "💳 *Subscription Status*\n\n"
-        "❌ Expired\n\n"
-        "Subscribe karo bot use karne ke liye!"
+        "🆓 Free Plan\n\n"
+        "Upgrade karo more features ke liye!\n/subscribe"
     )
 
 
-def _extract_otp(text: str) -> str:
-    return re.sub(r'\D', '', text)
+def _channel_list_text(uid: int) -> str:
+    dialogs = _get_dialogs_limited(uid)
+    if not dialogs:
+        return "Koi channel nahi mila."
+    lines = []
+    for i, (did, dn) in enumerate(dialogs):
+        lines.append(f"{i + 1}. {dn}")
+    footer = (
+        f"\n_Shown: {len(dialogs)} channels_\n"
+        f"⚠️ Agar channel nahi dikh raha:\n"
+        f"@username ya https://t.me/channel type karo"
+    )
+    return "\n".join(lines) + footer
 
+
+async def _notify_admin_start(bot: Bot, user, bot_name: str):
+    username = f"@{user.username}" if user.username else f"ID:{user.user_id}"
+    try:
+        await bot.send_message(
+            OWNER_ID,
+            f"👤 {username} ne *@{bot_name}* start kiya!\n"
+            f"Name: {user.full_name or '-'}\n"
+            f"ID: `{user.user_id}`",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────
+# REGISTER HANDLERS
+# ──────────────────────────────────────────────
 
 def register_handlers(dp: Dispatcher, bot: Bot):
 
-    # ---- /start ----
+    # ════════════════ /start ════════════════
     @dp.message_handler(commands=["start"])
     async def cmd_start(msg: types.Message):
         uid = msg.from_user.id
-        user = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
-        allowed, reason = db.check_access(user)
+        args = msg.get_args()
 
+        user, is_new = await db.get_or_create_user(
+            uid, msg.from_user.username or "", msg.from_user.full_name or ""
+        )
+
+        # Admin notification — only for new users
+        if is_new:
+            await _notify_admin_start(bot, user, MAIN_BOT_USERNAME)
+
+        # Referral tracking
+        if args and is_new:
+            aff = await db.get_affiliate_by_code(args.upper())
+            if aff and aff.user_id != uid:
+                await db.set_referred_by(uid, aff.user_id)
+
+        allowed, reason = db.check_access(user)
         if not allowed:
-            if reason == "banned":
-                await msg.answer(_access_denied_text("banned"))
-                return
-            await msg.answer(
-                "👋 *DealsKoti Forward Bot mein aapka swagat hai!*\n\n"
-                + _access_denied_text("expired"),
-                parse_mode="Markdown",
-                reply_markup=kb_subscribe_only(),
-            )
+            await msg.answer(_access_denied_text(reason))
             return
 
-        logged_in = await is_user_logged_in(uid)
-        if not logged_in:
+        if not is_user_logged_in(uid):
             await msg.answer(
-                "👋 *DealsKoti Forward Bot*\n\n"
-                "Messages automatically forward karo — bina Forwarded tag ke!\n\n"
+                f"👋 *Sandesh Forward Bot*\n\n"
+                f"Messages forward karo bina 'Forwarded from' tag ke!\n\n"
                 f"_{_status_line(user, reason)}_\n\n"
-                "Pehle apne Telegram account se login karo:",
+                f"Shuru karne ke liye login karo:",
                 parse_mode="Markdown",
                 reply_markup=kb_login(),
             )
             return
 
+        days_left = _plan_days_left(user)
         await msg.answer(
-            "🏠 *DealsKoti Forward Bot*\n\n"
+            f"🏠 *Sandesh Forward Bot*\n\n"
             f"_{_status_line(user, reason)}_\n\n"
-            "Neeche se option choose karo:",
+            f"Option choose karo:",
             parse_mode="Markdown",
-            reply_markup=kb_main(),
+            reply_markup=kb_main(user.plan, days_left),
         )
 
-    # ---- /login ----
+    # ════════════════ /login ════════════════
     @dp.message_handler(commands=["login"])
     async def cmd_login(msg: types.Message):
         uid = msg.from_user.id
-        user = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
-        allowed, reason = db.check_access(user)
-        if reason == "banned":
-            await msg.answer(_access_denied_text("banned"))
+        if is_user_logged_in(uid):
+            await msg.answer(
+                "✅ Already logged in ho! /start se menu dekho.",
+                reply_markup=kb_main_only(),
+            )
             return
-        if await is_user_logged_in(uid):
-            await msg.answer("Pehle se logged in ho! /start karo.")
-            return
-        login_states[uid] = {"step": "phone", "phone": None, "phone_hash": None}
+        login_states[uid] = {"step": "phone"}
         await msg.answer(
             "📱 *Login — Step 1/3*\n\n"
-            "Apna Telegram phone number dalo (country code ke saath):\n"
-            "Example: +919876543210",
+            "Phone number dalo (country code ke saath):\n"
+            "🇮🇳 India:  +919876543210\n"
+            "🇺🇸 USA:    +12025551234\n"
+            "🇬🇧 UK:     +447911123456\n\n"
+            "⚠️ Dhyan rakho:\n"
+            "- Plus (+) se shuru karo\n"
+            "- Numbers ke beech koi *space mat dalo*",
             parse_mode="Markdown",
         )
 
-    # ---- /logout ----
+    # ════════════════ /logout ════════════════
     @dp.message_handler(commands=["logout"])
     async def cmd_logout(msg: types.Message):
         uid = msg.from_user.id
-        if not await is_user_logged_in(uid):
-            await msg.answer(
-                "⚠️ Tum pehle se logged out ho!\n/login karke Telegram account connect karo.",
-                parse_mode="Markdown",
-            )
+        if not is_user_logged_in(uid):
+            await msg.answer("Already logged out ho. /login se login karo.")
             return
         await msg.answer(
-            "🚪 *Logout Confirm Karo*\n\n"
-            "Logout karne se tumhara Telegram session delete ho jayega.\n"
-            "Dobara /login karna padega.\n\n"
+            "🚪 *Logout*\n\n"
+            "Logout karne se:\n"
+            "- Teri session delete ho jaayegi\n"
+            "- Saari forwarding band ho jaayegi\n"
+            "- Tasks/Settings save rahenge\n\n"
             "Pakka logout karna hai?",
             parse_mode="Markdown",
             reply_markup=kb_logout_confirm(),
         )
 
-    # ---- /status ----
+    # ════════════════ /status ════════════════
     @dp.message_handler(commands=["status"])
     async def cmd_status(msg: types.Message):
-        uid = msg.from_user.id
-        user = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
-        allowed, reason = db.check_access(user)
-        if not allowed:
-            await msg.answer(_access_denied_text(reason), reply_markup=kb_subscribe_only() if reason != "banned" else None)
-            return
         await msg.answer(
             "📊 *Status*\n\nKya dekhna hai?",
             parse_mode="Markdown",
             reply_markup=kb_status_menu(),
         )
 
-    # ---- /groups ----
-    @dp.message_handler(commands=["groups"])
-    async def cmd_groups(msg: types.Message):
+    # ════════════════ /tasks ════════════════
+    @dp.message_handler(commands=["tasks"])
+    async def cmd_tasks(msg: types.Message):
         uid = msg.from_user.id
-        user = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
+        user = await db.get_user(uid)
+        if not user:
+            return
         allowed, reason = db.check_access(user)
         if not allowed:
-            await msg.answer(_access_denied_text(reason), reply_markup=kb_subscribe_only() if reason != "banned" else None)
+            await msg.answer(_access_denied_text(reason))
             return
-        groups = await _groups_to_dict(uid)
-        if not groups:
+        tasks = await _tasks_to_dict(uid)
+        if not tasks:
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("➕ New Group", callback_data="ng"))
-            await msg.answer("Koi group nahi hai. Naya banao!", reply_markup=kb)
+            kb.add(InlineKeyboardButton("➕ New Task", callback_data="ng"))
+            kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="mm"))
+            await msg.answer("*Tasks*\n\nKoi task nahi hai. Naya banao!", parse_mode="Markdown", reply_markup=kb)
         else:
-            await msg.answer("*Saare Groups:*", parse_mode="Markdown", reply_markup=kb_groups(groups))
+            await msg.answer("*Tasks*\n\nTask select karo:", parse_mode="Markdown", reply_markup=kb_task_list(tasks))
 
-    # ---- /startall ----
+    # ════════════════ /startall ════════════════
     @dp.message_handler(commands=["startall"])
     async def cmd_startall(msg: types.Message):
         uid = msg.from_user.id
-        user = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
-        allowed, reason = db.check_access(user)
-        if not allowed:
-            await msg.answer(_access_denied_text(reason), reply_markup=kb_subscribe_only() if reason != "banned" else None)
-            return
-        groups = await db.get_user_groups(uid)
-        ready = sum(1 for g in groups if
-                    any(ch.type == "incoming" for ch in g.channels) and
-                    any(ch.type == "outgoing" for ch in g.channels))
-        if ready == 0:
-            await msg.answer(
-                "⚠️ *Koi Group Ready Nahi Hai*\n\n"
-                "Start karne ke liye group mein incoming aur outgoing dono channels set hone chahiye.\n\n"
-                "/groups se setup karo.",
-                parse_mode="Markdown",
-            )
-            return
-        await msg.answer(
-            f"▶️ *Start All Groups*\n\n"
-            f"{ready} group(s) mein forwarding start ho jayegi.\n\n"
-            "Confirm karo?",
-            parse_mode="Markdown",
-            reply_markup=kb_startall_confirm(),
-        )
+        tasks = await db.get_user_tasks(uid)
+        count = 0
+        for t in tasks:
+            if any(ch.type == "source" for ch in t.channels) and any(ch.type == "target" for ch in t.channels):
+                await db.set_task_active(t.id, True)
+                count += 1
+        await msg.answer(f"▶️ *{count} task(s) start ho gaye!*", parse_mode="Markdown", reply_markup=kb_main_only())
 
-    # ---- /stopall ----
+    # ════════════════ /stopall ════════════════
     @dp.message_handler(commands=["stopall"])
     async def cmd_stopall(msg: types.Message):
         uid = msg.from_user.id
-        user = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
-        allowed, reason = db.check_access(user)
-        if not allowed:
-            await msg.answer(_access_denied_text(reason), reply_markup=kb_subscribe_only() if reason != "banned" else None)
-            return
-        await msg.answer(
-            "⏹ *Stop All Groups*\n\n"
-            "Saare groups mein forwarding STOP ho jayegi.\n\n"
-            "Confirm karo?",
-            parse_mode="Markdown",
-            reply_markup=kb_stopall_confirm(),
-        )
+        await db.set_all_tasks_active(uid, False)
+        await msg.answer("⏹ *Saare tasks band ho gaye!*", parse_mode="Markdown", reply_markup=kb_main_only())
 
-    # ---- /myplan ----
+    # ════════════════ /myplan ════════════════
     @dp.message_handler(commands=["myplan"])
     async def cmd_myplan(msg: types.Message):
         uid = msg.from_user.id
-        user = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
-        _, reason = db.check_access(user)
-        now = datetime.utcnow()
-
-        if reason == "banned":
-            await msg.answer(
-                "🚫 *Account Ban Hai*\n\nAapka access band kar diya gaya hai.\nSupport se contact karo.",
-                parse_mode="Markdown",
-            )
-            return
-
-        if "subscribed" in reason:
-            days_left = (user.sub_end - now).days if user.sub_end else 0
-            end_str = user.sub_end.strftime("%d %b %Y") if user.sub_end else "N/A"
-            await msg.answer(
-                "💳 *Mera Plan*\n\n"
-                "━━━━━━━━━━━━━━━━━━━\n"
-                "Plan: ₹69/month\n"
-                f"Status: ✅ Active\n"
-                f"Valid Until: {end_str}\n"
-                f"Din Bache: {days_left}\n"
-                "━━━━━━━━━━━━━━━━━━━\n\n"
-                "Renew karne ke liye /renew bhejo.",
-                parse_mode="Markdown",
-                reply_markup=kb_main_menu_only(),
-            )
-        elif "trial" in reason:
-            d = reason.split(":")[1]
-            end_str = user.trial_end.strftime("%d %b %Y") if user.trial_end else "N/A"
-            await msg.answer(
-                "💳 *Mera Plan*\n\n"
-                "━━━━━━━━━━━━━━━━━━━\n"
-                "Plan: Free Trial\n"
-                f"Status: ⏳ Active\n"
-                f"Trial Ends: {end_str}\n"
-                f"Din Bache: {d}\n"
-                "━━━━━━━━━━━━━━━━━━━\n\n"
-                "Trial khatam hone se pehle subscribe karo:\n"
-                "₹69/month — /subscribe",
-                parse_mode="Markdown",
-                reply_markup=kb_subscribe_only(),
-            )
-        else:
-            await msg.answer(
-                "💳 *Mera Plan*\n\n"
-                "━━━━━━━━━━━━━━━━━━━\n"
-                "Status: ❌ Expired\n"
-                "━━━━━━━━━━━━━━━━━━━\n\n"
-                "Subscribe karo bot use karne ke liye!\n"
-                "₹69/month — /subscribe",
-                parse_mode="Markdown",
-                reply_markup=kb_subscribe_only(),
-            )
-
-    # ---- /renew ----
-    @dp.message_handler(commands=["renew"])
-    async def cmd_renew(msg: types.Message):
-        uid = msg.from_user.id
-        user = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
-        if user.is_banned:
-            await msg.answer(_access_denied_text("banned"))
+        user = await db.get_user(uid)
+        if not user:
             return
         _, reason = db.check_access(user)
-        now = datetime.utcnow()
+        await msg.answer(
+            await _text_sub_status(user, reason),
+            parse_mode="Markdown",
+            reply_markup=kb_plans(),
+        )
 
-        if "subscribed" in reason and user.sub_end:
-            days_left = (user.sub_end - now).days
-            end_str = user.sub_end.strftime("%d %b %Y")
-            intro = (
-                f"📅 Abhi subscription {end_str} tak valid hai ({days_left} din bache).\n"
-                "Renew karne pe ye aur 30 din extend ho jayega.\n\n"
-            )
-        else:
-            intro = "🔄 Subscription renew karo — 30 din ka full access milega.\n\n"
-
-        await msg.answer("⏳ Payment link generate ho raha hai...")
-        try:
-            order_id, pay_url = await create_order(uid)
-            await msg.answer(
-                "💳 *Renew Subscription — ₹69/month*\n\n"
-                + intro +
-                "UPI, Card, Net Banking — sab accept hai.\n\n"
-                "Neeche button dabao aur pay karo:",
-                parse_mode="Markdown",
-                reply_markup=kb_subscribe(pay_url),
-            )
-        except Exception as err:
-            await msg.answer(f"❌ Payment link banane mein error. Thodi der baad try karo.\nError: {err}")
-
-    # ---- /subscribe ----
+    # ════════════════ /subscribe ════════════════
     @dp.message_handler(commands=["subscribe"])
     async def cmd_subscribe(msg: types.Message):
-        uid = msg.from_user.id
-        user = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
-        if user.is_banned:
-            await msg.answer(_access_denied_text("banned"))
-            return
-        await msg.answer("⏳ Payment link generate ho raha hai...")
-        try:
-            order_id, pay_url = await create_order(uid)
-            await msg.answer(
-                "💳 *Subscribe — ₹69/month*\n\n"
-                "30 din ka full access milega.\n"
-                "UPI, Card, Net Banking — sab accept hai.\n\n"
-                "Neeche button dabao aur pay karo:",
-                parse_mode="Markdown",
-                reply_markup=kb_subscribe(pay_url),
-            )
-        except Exception as err:
-            await msg.answer(f"❌ Payment link banane mein error aaya. Thodi der baad try karo.\nError: {err}")
+        await msg.answer(
+            "💳 *Plans*\n\nKaunsa plan lena hai?",
+            parse_mode="Markdown",
+            reply_markup=kb_plans(),
+        )
 
-    # ---- /help ----
+    # ════════════════ /help ════════════════
     @dp.message_handler(commands=["help"])
     async def cmd_help(msg: types.Message):
         uid = msg.from_user.id
-        user = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
-        _, reason = db.check_access(user)
-        status_line = _status_line(user, reason)
-
-        user_text = (
-            "❓ *Help — DealsKoti Forward Bot*\n"
-            + (f"\n_{status_line}_\n" if status_line else "") +
-            "\n━━━━━━━━━━━━━━━━━━━\n"
-            "*🔐 Login Kaise Kare:*\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
+        text = (
+            "❓ *Help — Sandesh Forward Bot*\n\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "*Login Kaise Kare:*\n"
             "1. /login bhejo\n"
-            "2. Phone number dalo (+919876543210)\n"
-            "3. OTP aaye to: word + OTP likho (e.g. code12345)\n"
-            "4. Agar 2FA hai → password dalo\n"
-            "5. Done! /start se menu khulega\n\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
-            "*📋 Tumhare Commands:*\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
+            "2. Phone: +919876543210\n"
+            "3. OTP aaye to: word+OTP (code12345)\n"
+            "4. 2FA? password dalo\n\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "*Commands:*\n"
             "/start — Main menu\n"
-            "/login — Telegram account se login\n"
-            "/logout — Logout karo\n"
-            "/groups — Groups manage karo\n"
-            "/status — Forwarding aur subscription status\n"
-            "/startall — Saare groups start\n"
-            "/stopall — Saare groups band\n"
-            "/myplan — Apna plan aur expiry dekho\n"
-            "/subscribe — ₹69/month subscription lo\n"
-            "/renew — Subscription renew karo\n"
-            "/help — Ye message\n\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
-            "*✨ Features:*\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
-            f"- Max {MAX_GROUPS} groups\n"
-            "- Top channels (pinned pehle)\n"
-            "- Bina Forwarded tag ke forward\n"
-            "- Private channels support\n"
-            "- 7 din free trial\n\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
-            "*💳 Subscription:*\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
-            "- 7 din FREE trial\n"
-            "- ₹69/month\n"
-            "- UPI, Card, Net Banking accept"
+            "/login — Login\n"
+            "/logout — Logout\n"
+            "/tasks — Tasks manage\n"
+            "/status — Forwarding status\n"
+            "/startall — Saare tasks start\n"
+            "/stopall — Saare tasks stop\n"
+            "/myplan — Plan details\n"
+            "/subscribe — Plans dekho\n"
+            "/refer — Refer & Earn\n"
+            "/help — Ye guide\n\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "*Support:*\n"
+            f"AI Help: @{SIMI_BOT_USERNAME}"
+        )
+        await msg.answer(text, parse_mode="Markdown", reply_markup=kb_main_only())
+
+    # ════════════════ /support ════════════════
+    @dp.message_handler(commands=["support"])
+    async def cmd_support(msg: types.Message):
+        await msg.answer(
+            f"🤖 *Support chahiye?*\n\n"
+            f"AI support ke liye:\n"
+            f"👉 @{SIMI_BOT_USERNAME}\n\n"
+            f"Simi tumhari madad karegi — login, tasks, plans, sab kuch!",
+            parse_mode="Markdown",
+            reply_markup=kb_main_only(),
         )
 
-        owner_extra = (
-            "\n\n━━━━━━━━━━━━━━━━━━━\n"
-            "*👑 Owner Commands:*\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
-            "*📊 Dashboard & Stats:*\n"
-            "/admin — Full dashboard (users + revenue)\n"
-            "/users — Saare users ki list\n"
-            "/revenue — Revenue report\n"
-            "/expiring — Agle 5 din mein expire hone wale\n\n"
-            "*👤 User Management:*\n"
-            "/give `<id>` `<days>` — User ko days do\n"
-            "/removeuser `<id>` — Access turant hatao\n"
-            "/ban `<id>` — User ban karo\n"
-            "/unban `<id>` — User unban karo\n"
-            "/check `<id>` — User ki poori detail\n\n"
-            "*📢 Broadcast:*\n"
-            "/broadcast — Saare users ko message bhejo\n"
-            "/cancel — Broadcast cancel karo"
-        )
-
-        if uid == OWNER_ID:
-            text = user_text + owner_extra
-        else:
-            text = user_text
-
-        await msg.answer(text, parse_mode="Markdown", reply_markup=kb_main_menu_only())
-
-    # ---- TEXT HANDLER (login + rename + broadcast) ----
+    # ════════════════ TEXT HANDLER ════════════════
     @dp.message_handler()
     async def text_handler(msg: types.Message):
         uid = msg.from_user.id
-        text = msg.text.strip()
+        text = (msg.text or "").strip()
 
-        # Broadcast flow (owner only)
-        if uid == OWNER_ID and uid in broadcast_state:
-            state = broadcast_state[uid]
-            if state["step"] == "waiting_message":
-                if text.startswith("/"):
-                    await msg.answer(
-                        "⚠️ Broadcast mein ho. Command type kiya toh /cancel karo pehle.\n"
-                        "Ya broadcast message likho (command nahi).",
-                    )
-                    return
-                state["text"] = text
-                state["step"] = "waiting_confirm"
-                users = await db.get_all_users()
-                count = sum(1 for u in users if not u.is_banned)
-                from keyboards import kb_confirm_broadcast
+        # Skip if admin is in broadcast/msg state — handled by admin.py
+        if uid == OWNER_ID and (uid in broadcast_state or uid in admin_msg_state):
+            return
+
+        user = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
+        user = user[0]
+
+        # ── LOGIN FLOW ──
+        ls = login_states.get(uid)
+        if ls:
+            await _handle_login_text(msg, uid, text, ls, bot)
+            return
+
+        # ── USER STATE: rename task ──
+        us = user_state.get(uid)
+        if us and us.get("action") == "rename":
+            task_id = us["task_id"]
+            if len(text) > 30:
+                await msg.answer("❌ Naam max 30 characters ka hona chahiye. Dobara type karo:")
+                return
+            await db.rename_task(task_id, text)
+            user_state.pop(uid, None)
+            task = await db.get_task(task_id)
+            tasks = await _tasks_to_dict(uid)
+            await msg.answer(
+                f"✅ Task rename ho gaya: *{text}*",
+                parse_mode="Markdown",
+                reply_markup=kb_task_list(tasks),
+            )
+            return
+
+        # ── USER STATE: channel input (@username or link) ──
+        if us and us.get("action") in ("set_source", "set_target"):
+            await _handle_channel_identifier(msg, uid, text, us, bot, user)
+            return
+
+        # ── USER STATE: filter/settings text inputs ──
+        if us and us.get("action"):
+            await _handle_settings_text(msg, uid, text, us, bot)
+            return
+
+        # Default
+        await msg.answer(
+            "Menu ke liye /start bhejo.",
+            reply_markup=kb_main_only(),
+        )
+
+
+    # ════════════════ LOGIN HELPER ════════════════
+
+    async def _handle_login_text(msg, uid, text, ls, bot):
+        from telethon.errors import (
+            SessionPasswordNeededError, PhoneCodeInvalidError,
+            PhoneCodeExpiredError, PasswordHashInvalidError,
+            FloodWaitError, PhoneNumberInvalidError,
+            PhoneNumberBannedError,
+        )
+
+        step = ls.get("step")
+
+        if step == "phone":
+            phone = text.strip()
+            # Validate phone
+            clean_phone = phone.replace(" ", "").replace("-", "")
+            if " " in phone or "-" in phone:
                 await msg.answer(
-                    f"📢 *Broadcast Preview*\n\n{text}\n\n"
-                    f"Ye message *{count} users* ko jayega.\nConfirm karo?",
+                    "❌ *Number mein space ya dash nahi hona chahiye!*\n\n"
+                    f"Tumne diya: `{phone}`\n"
+                    f"Sahi format: `{clean_phone}`\n\n"
+                    "Dobara bhejo (spaces hata ke):",
                     parse_mode="Markdown",
-                    reply_markup=kb_confirm_broadcast(),
+                )
+                return
+            if not clean_phone.startswith("+") or not clean_phone[1:].isdigit():
+                await msg.answer(
+                    "❌ *Phone format galat hai!*\n\n"
+                    "Country code ke saath dalo:\n"
+                    "🇮🇳 +919876543210\n"
+                    "🇺🇸 +12025551234\n\n"
+                    "Dobara bhejo:",
+                    parse_mode="Markdown",
+                )
+                return
+            try:
+                client = await create_client_for_login(uid)
+                result = await client.send_code_request(clean_phone)
+                ls["phone"] = clean_phone
+                ls["phone_hash"] = result.phone_code_hash
+                ls["step"] = "otp"
+                await msg.answer(
+                    "📨 *Login — Step 2/3*\n\n"
+                    "✅ OTP Telegram pe bhej diya!\n\n"
+                    "⚠️ *OTP seedha mat type karo!*\n"
+                    "Koi bhi word + OTP likho:\n"
+                    "Example: `code12345` ya `hello12345`\n\n"
+                    "_Seedha OTP doge to Telegram error dega_",
+                    parse_mode="Markdown",
+                )
+            except PhoneNumberInvalidError:
+                await msg.answer("❌ Ye phone number Telegram pe register nahi hai. Dobara try karo:")
+            except PhoneNumberBannedError:
+                await msg.answer("❌ Ye number Telegram pe banned hai.")
+                login_states.pop(uid, None)
+            except FloodWaitError as e:
+                await msg.answer(f"⏳ Bahut tries ho gaye. {e.seconds} seconds baad try karo.")
+                login_states.pop(uid, None)
+            except Exception as e:
+                await msg.answer(f"❌ Error: {str(e)[:200]}")
+            return
+
+        if step == "otp":
+            digits = re.sub(r"\D", "", text)
+            if not digits:
+                await msg.answer("❌ OTP mein digits nahi mile. `code12345` format mein do.")
+                return
+            try:
+                client = list(
+                    c for uid2, c in __import__("forwarder")._login_clients.items()
+                    if uid2 == uid
+                )[0] if uid in __import__("forwarder")._login_clients else None
+                if not client:
+                    await msg.answer("❌ Session expire. /login se dobara try karo.")
+                    login_states.pop(uid, None)
+                    return
+                await client.sign_in(ls["phone"], digits, phone_code_hash=ls["phone_hash"])
+                await finalize_login(uid)
+                login_states.pop(uid, None)
+                user, _ = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
+                days_left = _plan_days_left(user)
+                _, reason = db.check_access(user)
+                await msg.answer(
+                    "✅ *Login Ho Gaya!*\n\nAb forwarding setup karo:",
+                    parse_mode="Markdown",
+                    reply_markup=kb_main(user.plan, days_left),
+                )
+            except SessionPasswordNeededError:
+                ls["step"] = "2fa"
+                await msg.answer(
+                    "🔐 *Login — Step 3/3*\n\n"
+                    "Tumhara 2FA (Two-Factor Authentication) enable hai.\n"
+                    "Apna password dalo:",
+                    parse_mode="Markdown",
+                )
+            except (PhoneCodeInvalidError, PhoneCodeExpiredError):
+                await msg.answer(
+                    "❌ *OTP galat ya expire ho gaya!*\n\n"
+                    "/login se dobara try karo.",
+                    parse_mode="Markdown",
+                )
+                login_states.pop(uid, None)
+            except Exception as e:
+                await msg.answer(f"❌ Error: {str(e)[:200]}")
+            return
+
+        if step == "2fa":
+            try:
+                from forwarder import _login_clients
+                client = _login_clients.get(uid)
+                if not client:
+                    await msg.answer("❌ Session expire. /login se dobara try karo.")
+                    login_states.pop(uid, None)
+                    return
+                await client.sign_in(password=text)
+                await finalize_login(uid)
+                login_states.pop(uid, None)
+                user, _ = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
+                days_left = _plan_days_left(user)
+                _, reason = db.check_access(user)
+                await msg.answer(
+                    "✅ *Login Ho Gaya!*\n\nAb forwarding setup karo:",
+                    parse_mode="Markdown",
+                    reply_markup=kb_main(user.plan, days_left),
+                )
+            except Exception as e:
+                if "PASSWORD" in str(e).upper() or "password" in str(e).lower():
+                    await msg.answer("❌ Password galat hai. Dobara try karo:")
+                else:
+                    await msg.answer(f"❌ Error: {str(e)[:200]}")
+            return
+
+
+    async def _handle_channel_identifier(msg, uid, text, us, bot, user):
+        """Handle @username or t.me link typed by user for channel lookup."""
+        task_id = us["task_id"]
+        ch_type = "source" if us["action"] == "set_source" else "target"
+
+        # Check if it's an identifier (starts with @ or http)
+        is_identifier = text.startswith("@") or text.startswith("http")
+        if is_identifier:
+            await msg.answer("🔍 Channel dhundh raha hun...")
+            result = await resolve_channel(uid, text)
+            if not result:
+                await msg.answer(
+                    "❌ Channel nahi mila.\n"
+                    "Check karo:\n"
+                    "- Channel public hai?\n"
+                    "- Username sahi hai?\n"
+                    "- Bot/User us channel ka member hai?\n\n"
+                    "Dobara try karo ya list se number select karo:",
+                )
+                return
+            channel_id, channel_name = result
+            # Save this single channel
+            plan = user.plan
+            limits = get_plan_limits(plan)
+            max_allowed = limits["max_sources"] if ch_type == "source" else limits["max_targets"]
+
+            task = await db.get_task(task_id)
+            existing = [ch for ch in task.channels if ch.type == ch_type]
+            if len(existing) >= max_allowed:
+                await msg.answer(
+                    f"❌ Tumhare plan mein max {max_allowed} {ch_type} channels allowed hain.\n"
+                    f"Upgrade karo /subscribe"
                 )
                 return
 
-        user = await db.get_or_create_user(uid, msg.from_user.username or "", msg.from_user.full_name or "")
+            await db.set_task_channels(task_id, ch_type, [(channel_id, channel_name)] + [(c.channel_id, c.channel_name) for c in existing])
+            user_state.pop(uid, None)
+            await msg.answer(
+                f"✅ *{channel_name}* {ch_type} mein add ho gaya!",
+                parse_mode="Markdown",
+                reply_markup=kb_task(task_id, task.is_active, plan),
+            )
+            return
 
-        # LOGIN FLOW
-        ls = login_states.get(uid)
-        if ls:
-            from telethon.errors import (
-                SessionPasswordNeededError, PhoneCodeInvalidError,
-                PhoneCodeExpiredError, PasswordHashInvalidError,
-                FloodWaitError, PhoneNumberInvalidError,
-                PhoneNumberBannedError, PhoneNumberUnoccupiedError,
+        # Number selection from list
+        await _handle_channel_numbers(msg, uid, text, us, bot, user)
+
+
+    async def _handle_channel_numbers(msg, uid, text, us, bot, user):
+        task_id = us["task_id"]
+        ch_type = "source" if us["action"] == "set_source" else "target"
+        plan = user.plan
+        limits = get_plan_limits(plan)
+        max_allowed = limits["max_sources"] if ch_type == "source" else limits["max_targets"]
+
+        dialogs = _get_dialogs_limited(uid)
+        try:
+            nums = [int(n.strip()) for n in text.replace(",", " ").split() if n.strip().isdigit()]
+        except ValueError:
+            await msg.answer("❌ Sirf numbers type karo. Example: `1,3,5`", parse_mode="Markdown")
+            return
+
+        if not nums:
+            await msg.answer("❌ Koi valid number nahi mila. Example: `1,3,5`", parse_mode="Markdown")
+            return
+
+        if len(nums) > max_allowed:
+            await msg.answer(
+                f"❌ Tumhare plan mein max *{max_allowed}* {ch_type} channels allowed hain.\n"
+                f"Sirf {max_allowed} number select karo.",
+                parse_mode="Markdown",
+            )
+            return
+
+        selected = []
+        for n in nums:
+            if 1 <= n <= len(dialogs):
+                selected.append(dialogs[n - 1])
+
+        if not selected:
+            await msg.answer("❌ Koi valid channel nahi mila. Number list ke andar hona chahiye.")
+            return
+
+        # Validate: source != target
+        task = await db.get_task(task_id)
+        opposite_type = "target" if ch_type == "source" else "source"
+        opposite_ids = {ch.channel_id for ch in task.channels if ch.type == opposite_type}
+        selected_ids = {s[0] for s in selected}
+        conflict = selected_ids & opposite_ids
+        if conflict:
+            await msg.answer("❌ Same channel source aur target dono nahi ho sakta!")
+            return
+
+        await db.set_task_channels(task_id, ch_type, selected)
+        user_state.pop(uid, None)
+
+        names = "\n".join(f"  {i+1}. {s[1]}" for i, s in enumerate(selected))
+        task = await db.get_task(task_id)
+        await msg.answer(
+            f"✅ *{ch_type.capitalize()} channels set ho gaye!*\n\n{names}",
+            parse_mode="Markdown",
+            reply_markup=kb_task(task_id, task.is_active, plan),
+        )
+
+
+    async def _handle_settings_text(msg, uid, text, us, bot):
+        action = us.get("action")
+        task_id = us.get("task_id")
+        user = await db.get_user(uid)
+        plan = user.plan if user else "free"
+
+        if action == "set_header":
+            await db.update_task_settings(task_id, header_text=text)
+            user_state.pop(uid, None)
+            task = await db.get_task(task_id)
+            await msg.answer("✅ Header set ho gaya!", reply_markup=kb_message_settings(task_id, plan))
+
+        elif action == "set_footer":
+            await db.update_task_settings(task_id, footer_text=text)
+            user_state.pop(uid, None)
+            await msg.answer("✅ Footer set ho gaya!", reply_markup=kb_message_settings(task_id, plan))
+
+        elif action == "set_caption":
+            await db.update_task_settings(task_id, custom_caption=text)
+            user_state.pop(uid, None)
+            await msg.answer(
+                "✅ Custom caption set ho gaya!\n_Tip: {original_caption} placeholder use kar sakte ho_",
+                parse_mode="Markdown",
+                reply_markup=kb_message_settings(task_id, plan),
             )
 
-            if ls["step"] == "phone":
-                phone = text.strip()
-                if not phone.startswith("+") or not phone[1:].isdigit():
-                    await msg.answer(
-                        "❌ *Phone number galat format mein hai!*\n\n"
-                        "Country code ke saath dalo:\n"
-                        "Example: +919876543210\n\n"
-                        "Dobara try karo:",
-                        parse_mode="Markdown",
-                    )
-                    return
-                try:
-                    client = await create_client_for_login(uid)
-                    result = await client.send_code_request(phone)
-                    ls["phone"] = phone
-                    ls["phone_hash"] = result.phone_code_hash
-                    ls["step"] = "otp"
-                    await msg.answer(
-                        "📨 *Login — Step 2/3*\n\n"
-                        "✅ OTP Telegram pe bhej diya!\n\n"
-                        "⚠️ OTP seedha mat bhejo!\n"
-                        "Koi bhi word + OTP likho:\n"
-                        "Example: code12345 ya hello12345\n\n"
-                        "_(Ye Telegram security ke liye zaroori hai)_",
-                        parse_mode="Markdown",
-                    )
-                except PhoneNumberInvalidError:
-                    login_states.pop(uid, None)
-                    await msg.answer(
-                        "❌ *Phone number invalid hai!*\n\n"
-                        "Ye number Telegram pe registered nahi hai.\n"
-                        "Sahi number dalo aur dobara /login karo.",
-                        parse_mode="Markdown",
-                    )
-                except PhoneNumberBannedError:
-                    login_states.pop(uid, None)
-                    await msg.answer(
-                        "❌ *Ye number Telegram pe ban hai!*\n\n"
-                        "Dusra number try karo ya /login se dobara shuru karo.",
-                        parse_mode="Markdown",
-                    )
-                except PhoneNumberUnoccupiedError:
-                    login_states.pop(uid, None)
-                    await msg.answer(
-                        "❌ *Ye number Telegram pe registered nahi hai!*\n\n"
-                        "Pehle Telegram app se account banao, phir /login karo.",
-                        parse_mode="Markdown",
-                    )
-                except FloodWaitError as e:
-                    login_states.pop(uid, None)
-                    await msg.answer(
-                        f"⏳ *Telegram ne temporarily block kiya!*\n\n"
-                        f"{e.seconds // 60} minute {e.seconds % 60} second baad dobara try karo.",
-                        parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    login_states.pop(uid, None)
-                    await msg.answer(
-                        f"❌ *Login shuru karne mein error aaya!*\n\n"
-                        f"Error: {e}\n\nThodi der baad dobara /login karo.",
-                        parse_mode="Markdown",
-                    )
-                return
+        elif action == "set_blacklist":
+            words = [w.strip() for w in text.replace(",", "\n").splitlines() if w.strip()]
+            task = await db.get_task(task_id)
+            existing = task.blacklist_words or []
+            merged = list(set(existing + words))
+            await db.update_task_settings(task_id, blacklist_words=merged)
+            user_state.pop(uid, None)
+            await msg.answer(f"✅ {len(words)} words blacklist mein add ho gaye!", reply_markup=kb_filters(task_id, plan))
 
-            if ls["step"] == "otp":
-                otp = _extract_otp(text)
-                if not otp:
-                    await msg.answer(
-                        "❌ *OTP mein koi number nahi mila!*\n\n"
-                        "Koi bhi word + OTP likho:\n"
-                        "Example: code12345 ya hello12345",
-                        parse_mode="Markdown",
-                    )
-                    return
-                client = user_clients.get(uid)
-                if not client:
-                    login_states.pop(uid, None)
-                    await msg.answer("⚠️ Session expire ho gaya. Dobara /login karo.", parse_mode="Markdown")
-                    return
-                try:
-                    await client.sign_in(phone=ls["phone"], code=otp, phone_code_hash=ls["phone_hash"])
-                    login_states.pop(uid, None)
-                    await finalize_login(uid)
-                    await msg.answer(
-                        "✅ *Login Ho Gaye!*\n\n"
-                        "Aapka Telegram account successfully connect ho gaya!\n\n"
-                        "Ab /start karo aur forwarding setup karo!",
-                        parse_mode="Markdown",
-                    )
-                except SessionPasswordNeededError:
-                    ls["step"] = "2fa"
-                    await msg.answer(
-                        "🔒 *Login — Step 3/3*\n\n"
-                        "2-Step Verification ON hai.\n\n"
-                        "Apna Telegram cloud password dalo\n"
-                        "_(Telegram Settings → Privacy → Two-Step Verification wala)_:",
-                        parse_mode="Markdown",
-                    )
-                except PhoneCodeInvalidError:
-                    await msg.answer(
-                        "❌ *OTP galat hai!*\n\n"
-                        "Format: word + OTP\n"
-                        "Example: code12345\n\n"
-                        "Dobara try karo ya /login se restart karo:",
-                        parse_mode="Markdown",
-                    )
-                except PhoneCodeExpiredError:
-                    login_states.pop(uid, None)
-                    await msg.answer(
-                        "⏰ *OTP expire ho gaya!*\n\n"
-                        "OTP sirf 2 minute tak valid hota hai.\n"
-                        "Dobara /login karo aur OTP aate hi turant bhejo.",
-                        parse_mode="Markdown",
-                    )
-                except FloodWaitError as e:
-                    login_states.pop(uid, None)
-                    await msg.answer(
-                        f"⏳ *Bahut zyada galat attempts!*\n\n"
-                        f"{e.seconds // 60} minute baad try karo.",
-                        parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    login_states.pop(uid, None)
-                    await msg.answer(f"❌ Error: {e}\n\nDobara /login karo.", parse_mode="Markdown")
-                return
+        elif action == "set_whitelist":
+            words = [w.strip() for w in text.replace(",", "\n").splitlines() if w.strip()]
+            task = await db.get_task(task_id)
+            existing = task.whitelist_words or []
+            merged = list(set(existing + words))
+            await db.update_task_settings(task_id, whitelist_words=merged)
+            user_state.pop(uid, None)
+            await msg.answer(f"✅ {len(words)} words whitelist mein add ho gaye!", reply_markup=kb_filters(task_id, plan))
 
-            if ls["step"] == "2fa":
-                client = user_clients.get(uid)
-                if not client:
-                    login_states.pop(uid, None)
-                    await msg.answer("⚠️ Session expire ho gaya. Dobara /login karo.", parse_mode="Markdown")
-                    return
-                try:
-                    await client.sign_in(password=text)
-                    login_states.pop(uid, None)
-                    await finalize_login(uid)
-                    await msg.answer(
-                        "✅ *Login Ho Gaye!*\n\n"
-                        "2FA verify ho gaya! Account connected.\n\n"
-                        "Ab /start karo!",
-                        parse_mode="Markdown",
-                    )
-                except PasswordHashInvalidError:
-                    await msg.answer(
-                        "❌ *Password galat hai!*\n\n"
-                        "Telegram Settings → Privacy & Security → Two-Step Verification wala password chahiye.\n\n"
-                        "Dobara try karo:",
-                        parse_mode="Markdown",
-                    )
-                except FloodWaitError as e:
-                    login_states.pop(uid, None)
-                    await msg.answer(
-                        f"⏳ Bahut zyada galat attempts. {e.seconds // 60} minute baad try karo.",
-                        parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    login_states.pop(uid, None)
-                    await msg.answer(f"❌ Error: {e}\n\nDobara /login karo.", parse_mode="Markdown")
-                return
-
-        # RENAME FLOW
-        state = user_state.get(uid)
-        if state and state.get("action") == "rename":
-            ts = state.get("ts", 0)
-            if datetime.utcnow().timestamp() - ts > 300:
+        elif action == "set_regex":
+            import re as re_module
+            try:
+                re_module.compile(text)
+                await db.update_task_settings(task_id, regex_pattern=text)
                 user_state.pop(uid, None)
-            else:
-                gid = state["group_id"]
-                g = await db.get_group(gid)
-                if g and g.user_id == uid:
-                    new_name = text[:30].strip()
-                    if not new_name:
-                        await msg.answer("❌ Naam khali nahi ho sakta. Dobara likho:")
-                        return
-                    await db.rename_group(gid, new_name)
-                    user_state.pop(uid, None)
-                    await msg.answer(
-                        f"✅ Naam badal diya: *{new_name}*",
-                        parse_mode="Markdown",
-                        reply_markup=kb_group(gid, g.is_active),
-                    )
-                else:
-                    user_state.pop(uid, None)
-                    await msg.answer("Group nahi mila.")
-                return
+                await msg.answer("✅ Regex set ho gaya!", reply_markup=kb_filters(task_id, plan))
+            except re_module.error as e:
+                await msg.answer(f"❌ Regex invalid hai: {e}\n\nDobara try karo:")
 
-    # ---- CALLBACK HANDLER ----
+        elif action == "set_delay":
+            try:
+                seconds = float(text)
+                await db.update_task_settings(task_id, delay_mode="fixed", delay_seconds=seconds)
+                user_state.pop(uid, None)
+                task = await db.get_task(task_id)
+                await msg.answer(
+                    f"✅ Fixed delay set: {seconds}s",
+                    reply_markup=kb_advanced_settings(task_id, plan, task)
+                )
+            except ValueError:
+                await msg.answer("❌ Sirf number dalo. Example: 5 ya 2.5")
+
+        elif action == "set_delay_random":
+            parts = text.replace("-", " ").split()
+            try:
+                mn, mx = float(parts[0]), float(parts[1])
+                await db.update_task_settings(task_id, delay_mode="random", delay_random_min=mn, delay_random_max=mx)
+                user_state.pop(uid, None)
+                task = await db.get_task(task_id)
+                await msg.answer(
+                    f"✅ Random delay set: {mn}s - {mx}s",
+                    reply_markup=kb_advanced_settings(task_id, plan, task)
+                )
+            except (ValueError, IndexError):
+                await msg.answer("❌ Format: `min max` Example: `3 8`", parse_mode="Markdown")
+
+        elif action == "set_word_replace":
+            # Format: "original → new" or "original - new"
+            if "→" in text:
+                parts_split = text.split("→", 1)
+            elif " - " in text:
+                parts_split = text.split(" - ", 1)
+            else:
+                await msg.answer("❌ Format: `original → new`\nExample: `Amazon → My Store`", parse_mode="Markdown")
+                return
+            frm, to = parts_split[0].strip(), parts_split[1].strip()
+            task = await db.get_task(task_id)
+            pairs = task.word_replace_pairs or []
+            pairs.append({"from": frm, "to": to})
+            await db.update_task_settings(task_id, word_replace_pairs=pairs)
+            user_state.pop(uid, None)
+            await msg.answer(f"✅ Replace: `{frm}` → `{to}`", parse_mode="Markdown", reply_markup=kb_filters(task_id, plan))
+
+        elif action == "set_link_replacer":
+            lines = text.strip().splitlines()
+            if len(lines) < 2:
+                await msg.answer("❌ 2 lines chahiye:\nLine 1: Original link\nLine 2: New link")
+                return
+            orig, new = lines[0].strip(), lines[1].strip()
+            await db.add_link_replacer(task_id, orig, new)
+            user_state.pop(uid, None)
+            await msg.answer(
+                f"✅ Link replacer add ho gaya!\n`{orig}`\n→ `{new}`",
+                parse_mode="Markdown",
+                reply_markup=kb_filters(task_id, plan),
+            )
+
+        elif action == "set_watermark":
+            await db.update_task_settings(task_id, watermark_text=text, watermark_enabled=True)
+            user_state.pop(uid, None)
+            task = await db.get_task(task_id)
+            await msg.answer(
+                f"✅ Watermark set: `{text}`\nPosition: {task.watermark_position}",
+                parse_mode="Markdown",
+                reply_markup=kb_message_settings(task_id, plan),
+            )
+
+        elif action == "set_schedule":
+            # Format: "Mon-Fri 09:00-21:00"
+            await _parse_schedule(msg, uid, text, task_id, plan)
+
+        else:
+            user_state.pop(uid, None)
+
+
+    async def _parse_schedule(msg, uid, text, task_id, plan):
+        import re as re_mod
+        text = text.strip()
+        DAY_MAP = {
+            "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+            "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+            "friday": 4, "saturday": 5, "sunday": 6,
+        }
+        try:
+            time_match = re_mod.search(r"(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})", text)
+            start_time = time_match.group(1) if time_match else "00:00"
+            end_time = time_match.group(2) if time_match else "23:59"
+
+            day_part = text[:time_match.start()].strip().lower() if time_match else text.lower()
+            days = []
+            if "everyday" in day_part or "daily" in day_part or not day_part:
+                days = list(range(7))
+            elif "-" in day_part or "–" in day_part:
+                parts = re_mod.split(r"[-–]", day_part)
+                start_d = DAY_MAP.get(parts[0].strip(), 0)
+                end_d = DAY_MAP.get(parts[-1].strip(), 6)
+                days = list(range(start_d, end_d + 1))
+            else:
+                for word in re_mod.split(r"[,\s]+", day_part):
+                    d = DAY_MAP.get(word.strip())
+                    if d is not None:
+                        days.append(d)
+
+            days_str = ",".join(str(d) for d in sorted(set(days)))
+            await db.update_task_settings(
+                task_id,
+                schedule_enabled=True,
+                schedule_days=days_str,
+                schedule_start=start_time,
+                schedule_end=end_time,
+            )
+            user_state.pop(uid, None)
+            task = await db.get_task(task_id)
+            await msg.answer(
+                f"✅ Schedule set!\nDays: {days_str}\nTime: {start_time} - {end_time} (IST)",
+                reply_markup=kb_advanced_settings(task_id, plan, task)
+            )
+        except Exception as e:
+            await msg.answer(
+                f"❌ Format galat hai.\n\nExamples:\n"
+                f"`Mon-Fri 09:00-21:00`\n"
+                f"`Everyday 08:00-22:00`\n"
+                f"`Mon,Wed,Fri 10:00-20:00`",
+                parse_mode="Markdown",
+            )
+
+
+    # ════════════════ CALLBACK HANDLER ════════════════
+
     @dp.callback_query_handler()
-    async def on_callback(cb: types.CallbackQuery):
+    async def callback_handler(cb: types.CallbackQuery):
         uid = cb.from_user.id
         data = cb.data
 
-        user = await db.get_or_create_user(uid, cb.from_user.username or "", cb.from_user.full_name or "")
+        user, _ = await db.get_or_create_user(uid, cb.from_user.username or "", cb.from_user.full_name or "")
         allowed, reason = db.check_access(user)
+        plan = user.plan
 
-        # ---- LOGIN ----
-        if data == "do_login":
-            if await is_user_logged_in(uid):
-                await cb.message.edit_text("Pehle se logged in ho! /start karo.")
-                return
-            login_states[uid] = {"step": "phone", "phone": None, "phone_hash": None}
-            await cb.message.edit_text(
-                "📱 *Login — Step 1/3*\n\n"
-                "Apna phone number dalo (country code ke saath):\n"
-                "Example: +919876543210",
-                parse_mode="Markdown",
-            )
-            await cb.answer()
-            return
-
-        # ---- LOGOUT CONFIRM/CANCEL ----
-        if data == "logout_confirm":
-            await logout_user(uid)
-            login_states.pop(uid, None)
-            await cb.message.edit_text(
-                "✅ *Logout ho gaye!*\n\n/login karke dobara login karo.",
-                parse_mode="Markdown",
-            )
-            await cb.answer()
-            return
-
-        if data == "logout_cancel":
-            await cb.message.edit_text(
-                "✅ Logout cancel ho gaya. Bot use karte raho!",
-                reply_markup=kb_main_menu_only(),
-            )
-            await cb.answer()
-            return
-
-        # ---- SUBSCRIBE ----
-        if data == "subscribe":
-            if user.is_banned:
-                await cb.answer(_access_denied_text("banned"), show_alert=True)
-                return
-            await cb.answer("Payment link generate ho raha hai...")
-            try:
-                order_id, pay_url = await create_order(uid)
-                await cb.message.answer(
-                    "💳 *Subscribe — ₹69/month*\n\n"
-                    "30 din ka full access milega.\n"
-                    "UPI, Card, Net Banking — sab accept hai.\n\n"
-                    "Neeche button dabao aur pay karo:",
-                    parse_mode="Markdown",
-                    reply_markup=kb_subscribe(pay_url),
-                )
-            except Exception as err:
-                await cb.message.answer(f"❌ Error: {err}\n\nThodi der baad try karo.")
-            return
-
-        # ---- CHECK PAYMENT ----
-        if data == "check_payment":
-            fresh = await db.get_user(uid)
-            if fresh:
-                now = datetime.utcnow()
-                paid_active = fresh.sub_end and fresh.sub_end > now
-                trial_active = fresh.trial_end and fresh.trial_end > now and not fresh.sub_end
-                if paid_active or trial_active:
-                    await cb.answer("✅ Access active hai! Bot use kar sakte ho.", show_alert=True)
-                else:
-                    await cb.answer("❌ Payment confirm nahi hui abhi. Pay karo ya 1-2 min baad check karo.", show_alert=True)
-            return
-
-        # ---- STATUS MENU ----
-        if data == "status_groups":
-            if not allowed:
-                await cb.answer("Access nahi hai!", show_alert=True)
-                return
-            text = await _text_status(uid)
-            await cb.message.answer(text, parse_mode="Markdown", reply_markup=kb_status())
-            await cb.answer()
-            return
-
-        if data == "status_sub":
-            text = _sub_status_text(user, reason)
-            await cb.message.answer(
-                text,
-                parse_mode="Markdown",
-                reply_markup=kb_subscribe_only() if ("trial" in reason or "expired" in reason) else kb_main_menu_only(),
-            )
-            await cb.answer()
-            return
-
-        # ---- STARTALL CONFIRM/CANCEL ----
-        if data == "startall_confirm":
-            if not allowed:
-                await cb.answer("Access nahi hai!", show_alert=True)
-                return
-            groups = await db.get_user_groups(uid)
-            count = 0
-            for g in groups:
-                if any(ch.type == "incoming" for ch in g.channels) and any(ch.type == "outgoing" for ch in g.channels):
-                    await db.set_group_active(g.id, True)
-                    count += 1
-            await refresh_cache_for_user(uid)
-            await cb.message.edit_text(
-                f"▶️ *{count} group(s) start ho gaye!*\n\nForwarding shuru ho gayi.",
-                parse_mode="Markdown",
-                reply_markup=kb_main_menu_only(),
-            )
-            await cb.answer()
-            return
-
-        if data == "startall_cancel":
-            await cb.message.edit_text("✅ Cancel ho gaya.", reply_markup=kb_main_menu_only())
-            await cb.answer()
-            return
-
-        # ---- STOPALL CONFIRM/CANCEL ----
-        if data == "stopall_confirm":
-            await db.set_group_active_for_user(uid, False)
-            await refresh_cache_for_user(uid)
-            await cb.message.edit_text(
-                "⏹ *Sab groups band ho gaye!*",
-                parse_mode="Markdown",
-                reply_markup=kb_main_menu_only(),
-            )
-            await cb.answer()
-            return
-
-        if data == "stopall_cancel":
-            await cb.message.edit_text("✅ Cancel ho gaya.", reply_markup=kb_main_menu_only())
-            await cb.answer()
-            return
-
-        # bc_confirm / bc_cancel are handled by admin.py's dedicated handler (takes priority)
-
-        # ---- ACCESS CHECK for remaining callbacks ----
-        if not allowed:
-            await cb.answer("Access nahi hai! /subscribe karo.", show_alert=True)
-            return
-
-        if not await is_user_logged_in(uid):
-            if data not in ("mm", "hl", "subscribe"):
-                await cb.answer("Pehle /login karo!", show_alert=True)
-                return
-
-        # ---- MAIN MENU ----
-        # Clear rename state on any navigation callback (except rename callbacks themselves)
-        if not data.startswith("gr:"):
+        # Clear user_state on navigation callbacks
+        nav_prefixes = ("mm", "tl", "st", "fst", "sst", "hl", "pl", "ref", "rst", "rws")
+        if data in nav_prefixes or any(data.startswith(p + ":") for p in nav_prefixes):
             user_state.pop(uid, None)
 
+        # ── MAIN MENU ──
         if data == "mm":
-            user = await db.get_or_create_user(uid, cb.from_user.username or "", cb.from_user.full_name or "")
-            _, reason = db.check_access(user)
+            days_left = _plan_days_left(user)
             await cb.message.edit_text(
-                "🏠 *DealsKoti Forward Bot*\n\n"
-                f"_{_status_line(user, reason)}_\n\n"
-                "Option choose karo:",
+                f"🏠 *Sandesh Forward Bot*\n\n_{_status_line(user, reason)}_\n\nOption choose karo:",
                 parse_mode="Markdown",
-                reply_markup=kb_main(),
+                reply_markup=kb_main(plan, days_left),
             )
 
         elif data == "dm":
             await cb.message.delete()
 
-        elif data == "st":
-            await cb.message.edit_text(
-                "📊 *Status*\n\nKya dekhna hai?",
-                parse_mode="Markdown",
-                reply_markup=kb_status_menu(),
-            )
-
         elif data == "hl":
             await cb.message.answer(
                 "❓ *Quick Help*\n\n"
-                "1. Manage Groups → New Group\n"
-                "2. Incoming channel select → Confirm\n"
-                "3. Outgoing channel select → Confirm\n"
+                "1. Manage Tasks → New Task\n"
+                "2. Source channel select karo\n"
+                "3. Target channel select karo\n"
                 "4. Start Forwarding!\n\n"
-                f"Max {MAX_GROUPS} groups | Channels (pinned pehle)\n"
-                "/help se full guide dekho.",
+                f"Support: @{SIMI_BOT_USERNAME}",
                 parse_mode="Markdown",
-                reply_markup=kb_main_menu_only(),
+                reply_markup=kb_main_only(),
             )
 
-        elif data == "grp_list":
-            groups = await _groups_to_dict(uid)
-            if not groups:
-                from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-                kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("➕ New Group", callback_data="ng"))
-                kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="mm"))
-                await cb.message.edit_text(
-                    "*Groups*\n\nKoi group nahi hai. Naya banao!",
-                    parse_mode="Markdown",
-                    reply_markup=kb,
-                )
-            else:
-                await cb.message.edit_text(
-                    "*Saare Groups*\n\nGroup select karo:",
-                    parse_mode="Markdown",
-                    reply_markup=kb_groups(groups),
-                )
+        # ── STATUS ──
+        elif data == "st":
+            await cb.message.edit_text("📊 *Status*", parse_mode="Markdown", reply_markup=kb_status_menu())
 
-        elif data == "rename_prompt":
-            groups = await _groups_to_dict(uid)
-            if not groups:
-                await cb.answer("Pehle ek group banao!", show_alert=True)
+        elif data == "fst":
+            text = await _text_status(uid)
+            await cb.message.edit_text(text, parse_mode="Markdown", reply_markup=kb_status_menu())
+
+        elif data == "sst":
+            text = await _text_sub_status(user, reason)
+            await cb.message.edit_text(text, parse_mode="Markdown", reply_markup=kb_plans())
+
+        # ── LOGIN ──
+        elif data == "do_login":
+            login_states[uid] = {"step": "phone"}
+            await cb.message.edit_text(
+                "📱 *Login — Step 1/3*\n\n"
+                "Phone number dalo:\n"
+                "🇮🇳 +919876543210\n"
+                "🇺🇸 +12025551234\n\n"
+                "⚠️ Spaces mat dalo!",
+                parse_mode="Markdown",
+            )
+
+        # ── LOGOUT ──
+        elif data == "lg":
+            await cb.message.edit_text(
+                "🚪 *Logout*\n\nPakka?",
+                parse_mode="Markdown",
+                reply_markup=kb_logout_confirm(),
+            )
+
+        elif data == "lgc":
+            await logout_user(uid)
+            await cb.message.edit_text(
+                "✅ Logout ho gaya!\n\n/login se dobara connect karo.",
+                reply_markup=kb_main_only(),
+            )
+
+        # ── TASK LIST ──
+        elif data == "tl":
+            if not is_user_logged_in(uid):
+                await cb.answer("Pehle /login karo!", show_alert=True)
                 return
-            if len(groups) == 1:
-                gid = groups[0]["id"]
-                user_state[uid] = {"action": "rename", "group_id": gid, "ts": datetime.utcnow().timestamp()}
+            tasks = await _tasks_to_dict(uid)
+            if not tasks:
                 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
                 kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("❌ Cancel", callback_data="grp:" + str(gid)))
-                await cb.message.edit_text(
-                    f"*{groups[0]['name']}* ka naya naam type karo (max 30 chars):",
-                    parse_mode="Markdown",
-                    reply_markup=kb,
-                )
+                kb.add(InlineKeyboardButton("➕ New Task", callback_data="ng"))
+                kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="mm"))
+                await cb.message.edit_text("*Tasks*\n\nKoi task nahi.", parse_mode="Markdown", reply_markup=kb)
             else:
-                await cb.message.edit_text(
-                    "*Rename* — Pehle group select karo:",
-                    parse_mode="Markdown",
-                    reply_markup=kb_groups(groups),
-                )
+                await cb.message.edit_text("*Tasks*\n\nSelect karo:", parse_mode="Markdown", reply_markup=kb_task_list(tasks))
 
+        # ── NEW TASK ──
         elif data == "ng":
-            count = await db.count_user_groups(uid)
-            if count >= MAX_GROUPS:
-                await cb.answer(f"Max {MAX_GROUPS} groups bana sakte ho!", show_alert=True)
+            if not allowed:
+                await cb.answer("Access nahi!", show_alert=True)
                 return
-            existing = await db.get_user_groups(uid)
-            existing_nums = set()
-            for g in existing:
-                if g.name.startswith("Group "):
-                    try:
-                        existing_nums.add(int(g.name.split(" ")[1]))
-                    except Exception:
-                        pass
-            nid = next(i for i in range(1, MAX_GROUPS + 2) if i not in existing_nums)
-            g = await db.create_group(uid, f"Group {nid}")
+            limits = get_plan_limits(plan)
+            count = await db.count_user_tasks(uid)
+            if count >= limits["max_tasks"]:
+                await cb.answer(
+                    f"Max {limits['max_tasks']} tasks allowed ({plan_display_name(plan)} plan).\n"
+                    f"Upgrade karo /subscribe",
+                    show_alert=True,
+                )
+                return
+            existing = await db.get_user_tasks(uid)
+            existing_nums = {int(t.name.split()[-1]) for t in existing if t.name.startswith("Task ")}
+            n = 1
+            while n in existing_nums:
+                n += 1
+            task = await db.create_task(uid, f"Task {n}")
             await cb.message.edit_text(
-                f"*{g.name}* bana diya!\n\nAb incoming aur outgoing channels set karo.",
+                f"*Task {n}*\n\nStatus: 🔴 Stopped\nSource: -\nTarget: -",
                 parse_mode="Markdown",
-                reply_markup=kb_group(g.id, False),
+                reply_markup=kb_task(task.id, False, plan),
             )
 
-        elif data.startswith("grp:"):
-            gid = int(data[4:])
-            g = await db.get_group(gid)
-            if not g or g.user_id != uid:
-                await cb.answer("Group nahi mila!", show_alert=True)
+        # ── TASK DETAIL ──
+        elif data.startswith("t:"):
+            task_id = int(data[2:])
+            task = await db.get_task(task_id)
+            if not task or task.user_id != uid:
+                await cb.answer("Task nahi mila!", show_alert=True)
                 return
+            dialogs = user_dialogs.get(uid, [])
+            name_map = {d[0]: d[1] for d in dialogs}
+            src = [ch for ch in task.channels if ch.type == "source"]
+            tgt = [ch for ch in task.channels if ch.type == "target"]
+            src_text = ", ".join(name_map.get(ch.channel_id, ch.channel_name or str(ch.channel_id)) for ch in src) or "-"
+            tgt_text = ", ".join(name_map.get(ch.channel_id, ch.channel_name or str(ch.channel_id)) for ch in tgt) or "-"
+            status = "🟢 Running" if task.is_active else "🔴 Stopped"
             await cb.message.edit_text(
-                await _text_group(uid, gid),
+                f"*{task.name}*\n\nStatus: {status}\n\n"
+                f"📥 Source ({len(src)}): {src_text}\n"
+                f"📤 Target ({len(tgt)}): {tgt_text}",
                 parse_mode="Markdown",
-                reply_markup=kb_group(gid, g.is_active),
+                reply_markup=kb_task(task_id, task.is_active, plan),
             )
 
-        elif data.startswith("gi:") or data.startswith("go:"):
-            mode = "in" if data.startswith("gi:") else "out"
-            gid = int(data[3:])
-            g = await db.get_group(gid)
-            if not g or g.user_id != uid:
-                await cb.answer("Group nahi mila!", show_alert=True)
+        # ── TASK START ──
+        elif data.startswith("tst:"):
+            task_id = int(data[4:])
+            task = await db.get_task(task_id)
+            if not task or task.user_id != uid:
+                await cb.answer("Task nahi mila!", show_alert=True)
                 return
-            await cb.answer("Channels load ho rahe hain...")
+            src = [ch for ch in task.channels if ch.type == "source"]
+            tgt = [ch for ch in task.channels if ch.type == "target"]
+            if not src or not tgt:
+                await cb.answer("Pehle source aur target set karo!", show_alert=True)
+                return
+            await db.set_task_active(task_id, True)
+            await cb.answer("▶️ Task start ho gaya!")
+            # Refresh task detail
+            task = await db.get_task(task_id)
+            await cb.message.edit_reply_markup(reply_markup=kb_task(task_id, True, plan))
+
+        # ── TASK STOP ──
+        elif data.startswith("tsp:"):
+            task_id = int(data[4:])
+            await db.set_task_active(task_id, False)
+            await cb.answer("⏹ Task band ho gaya!")
+            await cb.message.edit_reply_markup(reply_markup=kb_task(task_id, False, plan))
+
+        # ── TASK DELETE (confirm screen) ──
+        elif data.startswith("td:"):
+            task_id = int(data[3:])
+            task = await db.get_task(task_id)
+            if not task or task.user_id != uid:
+                await cb.answer("Task nahi mila!", show_alert=True)
+                return
+            await cb.message.edit_text(
+                f"🗑️ *Delete '{task.name}'?*\n\nYe task aur iske saare settings delete ho jaayenge.",
+                parse_mode="Markdown",
+                reply_markup=kb_task_delete_confirm(task_id),
+            )
+
+        # ── TASK DELETE CONFIRMED ──
+        elif data.startswith("tdc:"):
+            task_id = int(data[4:])
+            await db.delete_task(task_id)
+            tasks = await _tasks_to_dict(uid)
+            await cb.message.edit_text(
+                "✅ *Task delete ho gaya!*",
+                parse_mode="Markdown",
+                reply_markup=kb_task_list(tasks) if tasks else kb_main_only(),
+            )
+
+        # ── TASK RENAME ──
+        elif data.startswith("tr:"):
+            task_id = int(data[3:])
+            user_state[uid] = {"action": "rename", "task_id": task_id}
+            await cb.message.edit_text(
+                "✏️ Naya naam type karo (max 30 chars):",
+                reply_markup=kb_main_only(),
+            )
+
+        # ── SET SOURCE ──
+        elif data.startswith("src:"):
+            task_id = int(data[4:])
+            if not is_user_logged_in(uid):
+                await cb.answer("Pehle /login karo!", show_alert=True)
+                return
+            await cb.message.answer("📋 Channels load ho rahi hain...")
+            dialogs = await load_dialogs(uid)
+            user_state[uid] = {"action": "set_source", "task_id": task_id}
+            await cb.message.answer(
+                f"📥 *Source Channel Select Karo*\n\n{_channel_list_text(uid)}\n\n"
+                f"Numbers type karo (comma se): `1,3,5`",
+                parse_mode="Markdown",
+            )
+
+        # ── SET TARGET ──
+        elif data.startswith("tgt:"):
+            task_id = int(data[4:])
+            if not is_user_logged_in(uid):
+                await cb.answer("Pehle /login karo!", show_alert=True)
+                return
+            await cb.message.answer("📋 Channels load ho rahi hain...")
             await load_dialogs(uid)
-            # FIX: DISPLAY_LIMIT se cap — 100+ dialogs se Telegram button/message limit exceed hoti thi
-            dialogs = _get_dialogs_limited(uid)
-            if not dialogs:
-                await cb.message.edit_text(
-                    "⚠️ *Channels Load Nahi Hue*\n\n"
-                    "Telegram session disconnect hai.\n\n"
-                    "/logout karo phir /login karo dobara.",
-                    parse_mode="Markdown",
-                    reply_markup=kb_group(gid, g.is_active),
-                )
-                return
-            existing = await db.get_channels(gid, "incoming" if mode == "in" else "outgoing")
-            selected = {ch.channel_id for ch in existing}
-            _set_selected(uid, gid, mode, selected)
-            label = "Incoming" if mode == "in" else "Outgoing"
-            text = (
-                f"*{g.name} — {label}*\n\n"
-                "📌 Pinned channels pehle dikhte hain\n"
-                "Number dabao to select/deselect karo:\n\n"
-                + _text_channel_list(uid, gid, mode)
-            )
-            await cb.message.edit_text(
-                text,
+            user_state[uid] = {"action": "set_target", "task_id": task_id}
+            await cb.message.answer(
+                f"📤 *Target Channel Select Karo*\n\n{_channel_list_text(uid)}\n\n"
+                f"Numbers type karo (comma se): `1,3,5`",
                 parse_mode="Markdown",
-                reply_markup=kb_channels(gid, mode, dialogs, selected),
             )
 
-        elif data.startswith("si:") or data.startswith("to:"):
-            mode = "in" if data.startswith("si:") else "out"
-            parts = data.split(":")
-            idx = int(parts[1])
-            gid = int(parts[2])
-            g = await db.get_group(gid)
-            if not g or g.user_id != uid:
+        # ── FILTERS MENU ──
+        elif data.startswith("fi:"):
+            task_id = int(data[3:])
+            task = await db.get_task(task_id)
+            if not task or task.user_id != uid:
+                await cb.answer("Task nahi mila!", show_alert=True)
                 return
-            dialogs = _get_dialogs_limited(uid)
-            if 0 <= idx < len(dialogs):
-                did = dialogs[idx][0]
-                selected = _get_selected(uid, gid, mode)
-                if did in selected:
-                    selected.discard(did)
-                else:
-                    selected.add(did)
-                _set_selected(uid, gid, mode, selected)
-                label = "Incoming" if mode == "in" else "Outgoing"
-                text = (
-                    f"*{g.name} — {label}*\n\n"
-                    "📌 Pinned channels pehle dikhte hain\n"
-                    "Number dabao to select/deselect karo:\n\n"
-                    + _text_channel_list(uid, gid, mode)
-                )
-                await cb.message.edit_text(
-                    text,
-                    parse_mode="Markdown",
-                    reply_markup=kb_channels(gid, mode, dialogs, selected),
-                )
-
-        elif data.startswith("sia:") or data.startswith("toa:"):
-            mode = "in" if data.startswith("sia:") else "out"
-            gid = int(data[4:])
-            g = await db.get_group(gid)
-            if not g or g.user_id != uid:
-                return
-            dialogs = _get_dialogs_limited(uid)
-            selected = {d[0] for d in dialogs}
-            _set_selected(uid, gid, mode, selected)
-            label = "Incoming" if mode == "in" else "Outgoing"
+            bl = ", ".join(task.blacklist_words or []) or "None"
+            wl = ", ".join(task.whitelist_words or []) or "None"
             await cb.message.edit_text(
-                f"*{g.name} — {label}*\n\nSab select ho gaye!\n\n" + _text_channel_list(uid, gid, mode),
+                f"⚙️ *Filters — {task.name}*\n\n"
+                f"Blacklist: {bl[:50]}\n"
+                f"Whitelist: {wl[:50]}\n"
+                f"Regex: {task.regex_pattern or 'None'}",
                 parse_mode="Markdown",
-                reply_markup=kb_channels(gid, mode, dialogs, selected),
+                reply_markup=kb_filters(task_id, plan),
             )
 
-        elif data.startswith("sic:") or data.startswith("toc:"):
-            mode = "in" if data.startswith("sic:") else "out"
-            gid = int(data[4:])
-            g = await db.get_group(gid)
-            if not g or g.user_id != uid:
-                return
-            dialogs = _get_dialogs_limited(uid)
-            _set_selected(uid, gid, mode, set())
-            label = "Incoming" if mode == "in" else "Outgoing"
+        # ── BLACKLIST ──
+        elif data.startswith("bl:"):
+            task_id = int(data[3:])
+            user_state[uid] = {"action": "set_blacklist", "task_id": task_id}
+            task = await db.get_task(task_id)
+            current = ", ".join(task.blacklist_words or []) or "Koi nahi"
             await cb.message.edit_text(
-                f"*{g.name} — {label}*\n\nSelection clear ho gayi!\n\n" + _text_channel_list(uid, gid, mode),
+                f"🚫 *Blacklist*\n\nCurrent: {current}\n\n"
+                f"Naye words add karo (comma se alag karo):\n"
+                f"Example: `casino, gambling, spam`",
                 parse_mode="Markdown",
-                reply_markup=kb_channels(gid, mode, dialogs, set()),
+                reply_markup=kb_main_only(),
             )
 
-        elif data.startswith("gc:") or data.startswith("gco:"):
-            mode = "in" if data.startswith("gc:") else "out"
-            gid = int(data[3:] if mode == "in" else data[4:])
-            g = await db.get_group(gid)
-            if not g or g.user_id != uid:
-                return
-            dialogs = _get_dialogs(uid)
-            name_map = {d[0]: d[1] for d in dialogs}
-            selected = _get_selected(uid, gid, mode)
-            if not selected:
-                await cb.answer("Koi channel select nahi kiya!", show_alert=True)
-                return
-
-            # ---- VALIDATION ----
-            await cb.answer("Checking permissions...")
-            failed = []
-            for did in selected:
-                ch_name = name_map.get(did, str(did))
-                if mode == "in":
-                    ok, result = await check_is_member(uid, did)
-                    if not ok:
-                        if result == "private_channel":
-                            failed.append(
-                                f"❌ *{ch_name}*\n"
-                                "   → Ye private channel hai. Pehle is channel ko join karo, tab select karo."
-                            )
-                        else:
-                            failed.append(
-                                f"❌ *{ch_name}*\n"
-                                "   → Channel access nahi mila. Pehle join karo."
-                            )
-                else:
-                    ok, result = await check_can_post(uid, did)
-                    if not ok:
-                        if result.startswith("no_permission_channel:"):
-                            name = result.split(":", 1)[1]
-                            failed.append(
-                                f"❌ *{name}* (Broadcast Channel)\n"
-                                "   → Ye ek broadcast channel hai — sirf admins post kar sakte hain.\n"
-                                "   → Apne Telegram number ko is channel ka Admin banao:\n"
-                                "   Channel → Edit → Administrators → Apna number → Post Messages ON karo"
-                            )
-                        elif result.startswith("no_permission:"):
-                            name = result.split(":", 1)[1]
-                            failed.append(
-                                f"❌ *{name}*\n"
-                                "   → Is group mein messages send karne ki permission nahi hai.\n"
-                                "   → Ya toh group settings change karo (sab members post kar saken),\n"
-                                "   → Ya apne number ko Admin bana do is group mein."
-                            )
-                        elif result.startswith("not_member:"):
-                            name = result.split(":", 1)[1]
-                            failed.append(
-                                f"❌ *{name}*\n"
-                                "   → Aapka Telegram account (jis number se login kiya) is group/channel mein joined nahi hai.\n"
-                                "   → Telegram mein jaao → Group join karo → Wapas aao."
-                            )
-                        else:
-                            parts_r = result.split(":", 2)
-                            err_name = parts_r[1] if len(parts_r) > 1 else ch_name
-                            failed.append(
-                                f"❌ *{err_name}*\n"
-                                "   → Access check fail hua. Group mein joined ho aur send permission ho — check karo."
-                            )
-
-            if failed:
-                label = "Incoming" if mode == "in" else "Outgoing"
-                err_lines = "\n\n".join(failed)
-                if mode == "in":
-                    guide = (
-                        "💡 *Incoming kaise set kare:*\n"
-                        "Jis channel ke messages copy karne hain, us channel mein *aapka Telegram account (jis number se login kiya) joined hona chahiye.*\n\n"
-                        "✅ Simple fix: Telegram mein wo channel open karo → Join karo → Wapas bot mein aao → Dobara select karo"
-                    )
-                else:
-                    guide = (
-                        "💡 *Outgoing kaise set kare:*\n"
-                        "Jis group mein messages bhejne hain, usme *aapka Telegram account member hona chahiye* aur *message bhejne ki permission honi chahiye.*\n\n"
-                        "✅ Normal group (jahan sab members post kar sakte hain): Bas join karo\n"
-                        "✅ Restricted group (jahan sirf admins post kar sakte hain): Apne aap ko admin banao\n\n"
-                        "Telegram → Group → Join/Admin set karo → Wapas aao → Dobara select karo"
-                    )
-                await cb.message.edit_text(
-                    f"⚠️ *Ek Chhoti Si Setting Karni Hai!*\n\n"
-                    f"{err_lines}\n\n"
-                    "━━━━━━━━━━━━━━━\n"
-                    f"{guide}",
-                    parse_mode="Markdown",
-                    reply_markup=kb_group(gid, g.is_active),
-                )
-                return
-
-            # ---- SAVE ----
-            ch_type = "incoming" if mode == "in" else "outgoing"
-            channel_list = [(did, name_map.get(did, str(did))) for did in selected]
-            await db.set_channels(gid, ch_type, channel_list)
-            _clear_selected(uid, gid, mode)
-            count = len(selected)
-            names = "\n".join("- " + name_map.get(d, str(d)) for d in selected)
-            if mode == "in":
-                await cb.message.edit_text(
-                    f"✅ *Incoming Confirmed!*\n\n{count} channel(s) set:\n{names}\n\nAb outgoing group set karo jisme forward karna hai.",
-                    parse_mode="Markdown",
-                    reply_markup=kb_after_incoming(gid),
-                )
-            else:
-                await cb.message.edit_text(
-                    f"✅ *Outgoing Confirmed!*\n\n{count} group(s) set:\n{names}\n\nAb forwarding start karo!",
-                    parse_mode="Markdown",
-                    reply_markup=kb_after_outgoing(gid),
-                )
-
-        elif data.startswith("gs:"):
-            gid = int(data[3:])
-            g = await db.get_group(gid)
-            if not g or g.user_id != uid:
-                return
-            in_chs = [ch for ch in g.channels if ch.type == "incoming"]
-            out_chs = [ch for ch in g.channels if ch.type == "outgoing"]
-            if not in_chs:
-                await cb.answer("Pehle incoming channel set karo!", show_alert=True)
-                return
-            if not out_chs:
-                await cb.answer("Pehle outgoing channel set karo!", show_alert=True)
-                return
-            await db.set_group_active(gid, True)
-            await refresh_cache_for_user(uid)
-            dialogs = _get_dialogs(uid)
-            name_map = {d[0]: d[1] for d in dialogs}
-            in_names = ", ".join(name_map.get(ch.channel_id, str(ch.channel_id)) for ch in in_chs)
-            out_names = ", ".join(name_map.get(ch.channel_id, str(ch.channel_id)) for ch in out_chs)
+        # ── WHITELIST ──
+        elif data.startswith("wl:"):
+            task_id = int(data[3:])
+            user_state[uid] = {"action": "set_whitelist", "task_id": task_id}
+            task = await db.get_task(task_id)
+            current = ", ".join(task.whitelist_words or []) or "Koi nahi"
             await cb.message.edit_text(
-                f"▶️ *Forwarding Started!*\n\n"
-                f"*{g.name}*\n"
-                f"📥 From: {in_names}\n"
-                f"📤 To: {out_names}\n\n"
-                "Messages automatically forward ho rahe hain!",
+                f"✅ *Whitelist*\n\nCurrent: {current}\n\n"
+                f"Sirf in words wale messages forward honge.\n"
+                f"Words add karo (comma se):\n"
+                f"Example: `deal, offer, discount`",
                 parse_mode="Markdown",
-                reply_markup=kb_after_start(gid),
+                reply_markup=kb_main_only(),
             )
 
-        elif data.startswith("gx:"):
-            gid = int(data[3:])
-            g = await db.get_group(gid)
-            if not g or g.user_id != uid:
-                return
-            await db.set_group_active(gid, False)
-            await refresh_cache_for_user(uid)
+        # ── REGEX ──
+        elif data.startswith("rx:"):
+            task_id = int(data[3:])
+            user_state[uid] = {"action": "set_regex", "task_id": task_id}
+            task = await db.get_task(task_id)
             await cb.message.edit_text(
-                f"⏹ *{g.name}* band ho gaya!",
+                f"🔤 *Regex Filter*\n\nCurrent: `{task.regex_pattern or 'None'}`\n\n"
+                f"Regex pattern type karo:\n"
+                f"Example: `.*discount.*` ya `^Deal:`",
                 parse_mode="Markdown",
-                reply_markup=kb_group(gid, False),
+                reply_markup=kb_main_only(),
             )
 
-        elif data.startswith("gr:"):
-            gid = int(data[3:])
-            g = await db.get_group(gid)
-            if not g or g.user_id != uid:
+        # ── WORD REPLACE ──
+        elif data.startswith("wr:"):
+            task_id = int(data[3:])
+            user_state[uid] = {"action": "set_word_replace", "task_id": task_id}
+            task = await db.get_task(task_id)
+            pairs = task.word_replace_pairs or []
+            current = "\n".join(f"  `{p['from']}` → `{p['to']}`" for p in pairs) or "Koi nahi"
+            await cb.message.edit_text(
+                f"🔄 *Word Replace*\n\nCurrent pairs:\n{current}\n\n"
+                f"Naya pair add karo:\n"
+                f"Format: `original → new`\n"
+                f"Example: `Amazon → My Store`",
+                parse_mode="Markdown",
+                reply_markup=kb_main_only(),
+            )
+
+        # ── LINK REPLACER ──
+        elif data.startswith("lr:"):
+            task_id = int(data[3:])
+            user_state[uid] = {"action": "set_link_replacer", "task_id": task_id}
+            replacers = await db.get_link_replacers(task_id)
+            lines = [f"  `{r.original_link[:30]}` → `{r.new_link[:30]}`" for r in replacers]
+            current = "\n".join(lines) or "Koi nahi"
+            await cb.message.edit_text(
+                f"🔗 *Link Replacer*\n\nCurrent:\n{current}\n\n"
+                f"Naya replacer add karo (2 lines):\n"
+                f"Line 1: Original link\n"
+                f"Line 2: New link",
+                parse_mode="Markdown",
+                reply_markup=kb_main_only(),
+            )
+
+        # ── MEDIA FILTER ──
+        elif data.startswith("mf:"):
+            task_id = int(data[3:])
+            task = await db.get_task(task_id)
+            if not task or task.user_id != uid:
+                await cb.answer("Task nahi mila!", show_alert=True)
                 return
-            user_state[uid] = {"action": "rename", "group_id": gid, "ts": datetime.utcnow().timestamp()}
+            await cb.message.edit_text(
+                f"🖼️ *Media Filter — {task.name}*\n\nKaunse media forward karne hain?",
+                parse_mode="Markdown",
+                reply_markup=kb_media_filter(task_id, task.media_filter),
+            )
+
+        # ── MEDIA FILTER TOGGLE ──
+        elif data.startswith("mft:"):
+            _, key, task_id_str = data.split(":")
+            task_id = int(task_id_str)
+            task = await db.get_task(task_id)
+            defaults = {"images": True, "videos": True, "documents": True,
+                        "audio": True, "stickers": False, "links": True}
+            mf = dict(task.media_filter or defaults)
+            mf[key] = not mf.get(key, defaults.get(key, True))
+            await db.update_task_settings(task_id, media_filter=mf)
+            task = await db.get_task(task_id)
+            await cb.message.edit_reply_markup(reply_markup=kb_media_filter(task_id, task.media_filter))
+            await cb.answer()
+            return
+
+        # ── MESSAGE SETTINGS ──
+        elif data.startswith("ms:"):
+            task_id = int(data[3:])
+            task = await db.get_task(task_id)
+            if not task or task.user_id != uid:
+                await cb.answer("Task nahi mila!", show_alert=True)
+                return
+            rl_icon = "✅" if task.remove_links else "❌"
+            await cb.message.edit_text(
+                f"🛠️ *Message Settings — {task.name}*\n\n"
+                f"Header: {task.header_text or 'None'}\n"
+                f"Footer: {task.footer_text or 'None'}\n"
+                f"Remove Links: {rl_icon}",
+                parse_mode="Markdown",
+                reply_markup=kb_message_settings(task_id, plan),
+            )
+
+        # ── HEADER ──
+        elif data.startswith("hd:"):
+            task_id = int(data[3:])
+            user_state[uid] = {"action": "set_header", "task_id": task_id}
+            task = await db.get_task(task_id)
+            await cb.message.edit_text(
+                f"📝 *Header Text*\n\nCurrent: `{task.header_text or 'None'}`\n\n"
+                f"Naya header type karo (ya 'none' type karo hatane ke liye):",
+                parse_mode="Markdown",
+                reply_markup=kb_main_only(),
+            )
+
+        # ── FOOTER ──
+        elif data.startswith("ft:"):
+            task_id = int(data[3:])
+            user_state[uid] = {"action": "set_footer", "task_id": task_id}
+            task = await db.get_task(task_id)
+            await cb.message.edit_text(
+                f"📝 *Footer Text*\n\nCurrent: `{task.footer_text or 'None'}`\n\n"
+                f"Naya footer type karo:",
+                parse_mode="Markdown",
+                reply_markup=kb_main_only(),
+            )
+
+        # ── CUSTOM CAPTION ──
+        elif data.startswith("cp:"):
+            task_id = int(data[3:])
+            user_state[uid] = {"action": "set_caption", "task_id": task_id}
+            task = await db.get_task(task_id)
+            await cb.message.edit_text(
+                f"💬 *Custom Caption*\n\nCurrent: `{task.custom_caption or 'None'}`\n\n"
+                f"Naya caption type karo.\n"
+                f"_Tip: {{original_caption}} se original caption include kar sakte ho_",
+                parse_mode="Markdown",
+                reply_markup=kb_main_only(),
+            )
+
+        # ── REMOVE LINKS TOGGLE ──
+        elif data.startswith("rl:"):
+            task_id = int(data[3:])
+            task = await db.get_task(task_id)
+            if not task or task.user_id != uid:
+                await cb.answer("Task nahi mila!", show_alert=True)
+                return
+            new_val = not task.remove_links
+            await db.update_task_settings(task_id, remove_links=new_val)
+            icon = "✅" if new_val else "❌"
+            await cb.answer(f"Remove Links: {icon}")
+            await cb.message.edit_reply_markup(reply_markup=kb_message_settings(task_id, plan))
+
+        # ── ADVANCED SETTINGS ──
+        elif data.startswith("as:"):
+            task_id = int(data[3:])
+            task = await db.get_task(task_id)
+            if not task or task.user_id != uid:
+                await cb.answer("Task nahi mila!", show_alert=True)
+                return
+            await cb.message.edit_text(
+                f"⚙️ *Advanced Settings — {task.name}*",
+                parse_mode="Markdown",
+                reply_markup=kb_advanced_settings(task_id, plan, task),
+            )
+
+        # ── DELAY ──
+        elif data.startswith("dl:"):
+            task_id = int(data[3:])
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("❌ Cancel", callback_data="grp:" + str(gid)))
+            kb = InlineKeyboardMarkup(row_width=2)
+            kb.add(
+                InlineKeyboardButton("⏱️ Fixed", callback_data=f"dlf:{task_id}"),
+                InlineKeyboardButton("🎲 Random", callback_data=f"dlr:{task_id}"),
+                InlineKeyboardButton("❌ No Delay", callback_data=f"dln:{task_id}"),
+            )
+            kb.add(InlineKeyboardButton("🔙 Back", callback_data=f"as:{task_id}"))
+            await cb.message.edit_text("⏱️ *Delay Type*\n\nKaunsa delay chahiye?", parse_mode="Markdown", reply_markup=kb)
+
+        elif data.startswith("dlf:"):
+            task_id = int(data[4:])
+            user_state[uid] = {"action": "set_delay", "task_id": task_id}
+            await cb.message.edit_text("⏱️ Fixed delay seconds mein type karo:\nExample: `5` ya `2.5`", parse_mode="Markdown", reply_markup=kb_main_only())
+
+        elif data.startswith("dlr:"):
+            task_id = int(data[4:])
+            user_state[uid] = {"action": "set_delay_random", "task_id": task_id}
+            await cb.message.edit_text("🎲 Random delay range type karo:\nFormat: `min max`\nExample: `3 8`", parse_mode="Markdown", reply_markup=kb_main_only())
+
+        elif data.startswith("dln:"):
+            task_id = int(data[4:])
+            await db.update_task_settings(task_id, delay_mode="none", delay_seconds=0)
+            await cb.answer("✅ Delay hataa diya!")
+            task = await db.get_task(task_id)
+            await cb.message.edit_reply_markup(reply_markup=kb_advanced_settings(task_id, plan, task))
+
+        # ── SKIP DUPLICATES TOGGLE ──
+        elif data.startswith("sd:"):
+            task_id = int(data[3:])
+            task = await db.get_task(task_id)
+            if not task or task.user_id != uid:
+                await cb.answer("Task nahi mila!", show_alert=True)
+                return
+            new_val = not task.skip_duplicates
+            await db.update_task_settings(task_id, skip_duplicates=new_val)
+            icon = "✅" if new_val else "❌"
+            await cb.answer(f"Skip Duplicates: {icon}")
+            task = await db.get_task(task_id)
+            await cb.message.edit_reply_markup(reply_markup=kb_advanced_settings(task_id, plan, task))
+
+        # ── PINNED ONLY TOGGLE ──
+        elif data.startswith("po:"):
+            task_id = int(data[3:])
+            task = await db.get_task(task_id)
+            if not task or task.user_id != uid:
+                await cb.answer("Task nahi mila!", show_alert=True)
+                return
+            new_val = not task.pinned_only
+            await db.update_task_settings(task_id, pinned_only=new_val)
+            icon = "✅" if new_val else "❌"
+            await cb.answer(f"Pinned Only: {icon}")
+            task = await db.get_task(task_id)
+            await cb.message.edit_reply_markup(reply_markup=kb_advanced_settings(task_id, plan, task))
+
+        # ── SCHEDULE ──
+        elif data.startswith("sc:"):
+            task_id = int(data[3:])
+            task = await db.get_task(task_id)
+            user_state[uid] = {"action": "set_schedule", "task_id": task_id}
+            sch = "None"
+            if task.schedule_enabled:
+                sch = f"Days: {task.schedule_days} | Time: {task.schedule_start}-{task.schedule_end}"
             await cb.message.edit_text(
-                f"*{g.name}* ka naya naam type karo (max 30 chars):",
+                f"📅 *Schedule*\n\nCurrent: {sch}\n\n"
+                f"Format type karo:\n"
+                f"`Mon-Fri 09:00-21:00`\n"
+                f"`Everyday 08:00-22:00`\n"
+                f"`Mon,Wed,Fri 10:00-20:00`",
                 parse_mode="Markdown",
-                reply_markup=kb,
+                reply_markup=kb_main_only(),
             )
 
-        elif data.startswith("gd:"):
-            gid = int(data[3:])
-            g = await db.get_group(gid)
-            if not g or g.user_id != uid:
-                return
+        # ── WATERMARK ──
+        elif data.startswith("wm:"):
+            task_id = int(data[3:])
+            user_state[uid] = {"action": "set_watermark", "task_id": task_id}
+            task = await db.get_task(task_id)
             await cb.message.edit_text(
-                f"*{g.name}* delete karna chahte ho?\n\nYe action undo nahi hogi!",
+                f"🎨 *Watermark*\n\nCurrent: `{task.watermark_text or 'None'}`\n\n"
+                f"Watermark text type karo:\nExample: `@MyChannel`",
                 parse_mode="Markdown",
-                reply_markup=kb_delete_confirm(gid),
+                reply_markup=kb_main_only(),
             )
 
-        elif data.startswith("gdf:"):
-            gid = int(data[4:])
-            g = await db.get_group(gid)
-            if not g or g.user_id != uid:
-                await cb.answer("Group nahi mila!", show_alert=True)
-                return
-            try:
-                await db.delete_group(gid)
-            except Exception as e:
-                await cb.answer(f"Delete fail hua: {e}", show_alert=True)
-                return
-            await refresh_cache_for_user(uid)
-            groups = await _groups_to_dict(uid)
-            if not groups:
-                from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-                kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("➕ New Group", callback_data="ng"))
-                kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="mm"))
+        # ── PLANS ──
+        elif data == "pl":
+            await cb.message.edit_text(
+                "💳 *Plans*\n\n"
+                "🆓 Free — 1 Task | 1 Source | 1 Target | 60 msgs/day\n\n"
+                "⭐ Basic — $1/mo | $10/yr\n"
+                "   3 Tasks | 3 Sources | 3 Targets\n"
+                "   Header/Footer, Delay, Media Filter\n\n"
+                "💎 Pro — $2/mo | $20/yr\n"
+                "   5 Tasks | 8 Sources | 8 Targets\n"
+                "   All Basic + Schedule, Whitelist, Link Replacer\n\n"
+                "🚀 Business — $5/mo | $45/yr\n"
+                "   10 Tasks | 15 Sources | 15 Targets\n"
+                "   All Pro + Regex, Watermark, Priority Support\n\n"
+                "_Annual plan = 2 months FREE!_",
+                parse_mode="Markdown",
+                reply_markup=kb_plans(),
+            )
+
+        elif data.startswith("pp:"):
+            parts = data.split(":")
+            plan_key = parts[1]
+            billing = parts[2] if len(parts) > 2 else "choose"
+
+            if billing == "choose":
                 await cb.message.edit_text(
-                    "✅ *Group delete ho gaya!*\n\nKoi group nahi bacha.",
+                    f"💳 {plan_display_name(plan_key)}\n\nBilling choose karo:",
                     parse_mode="Markdown",
-                    reply_markup=kb,
+                    reply_markup=kb_plan_billing(plan_key),
                 )
             else:
-                await cb.message.edit_text(
-                    "✅ *Group delete ho gaya!*\n\n*Baaki Groups:*",
-                    parse_mode="Markdown",
-                    reply_markup=kb_groups(groups),
-                )
+                # Create payment
+                try:
+                    _, url, amount_paise, amount_usd = await create_order(uid, plan_key, billing)
+                    plan_name = plan_display_name(plan_key)
+                    billing_label = "Monthly" if billing == "monthly" else "Annual"
+                    await cb.message.edit_text(
+                        f"💳 *{plan_name} — {billing_label}*\n\n"
+                        f"Amount: ${amount_usd:.0f} (₹{amount_paise // 100})\n\n"
+                        f"Neeche link pe click karo aur payment karo.\n"
+                        f"Payment ke baad automatic activate ho jaayega!",
+                        parse_mode="Markdown",
+                        reply_markup=kb_payment_link(url),
+                    )
+                except Exception as e:
+                    await cb.message.edit_text(
+                        f"❌ Payment link create karne mein error:\n{str(e)[:200]}\n\nThodi der baad try karo.",
+                        reply_markup=kb_main_only(),
+                    )
 
+        # ── START ALL ──
         elif data == "sa":
-            groups = await db.get_user_groups(uid)
-            count = 0
-            for g in groups:
-                if any(ch.type == "incoming" for ch in g.channels) and any(ch.type == "outgoing" for ch in g.channels):
-                    await db.set_group_active(g.id, True)
-                    count += 1
-            await refresh_cache_for_user(uid)
-            await cb.answer(f"▶️ {count} groups start ho gaye!", show_alert=True)
-            return
+            await cb.message.edit_text(
+                "▶️ *Start All Tasks?*\n\nSaare tasks start ho jaayenge.",
+                parse_mode="Markdown",
+                reply_markup=kb_startall_confirm(),
+            )
 
+        elif data == "sac":
+            tasks = await db.get_user_tasks(uid)
+            count = 0
+            for t in tasks:
+                if any(ch.type == "source" for ch in t.channels) and any(ch.type == "target" for ch in t.channels):
+                    await db.set_task_active(t.id, True)
+                    count += 1
+            await cb.message.edit_text(
+                f"▶️ *{count} task(s) start ho gaye!*",
+                parse_mode="Markdown",
+                reply_markup=kb_main_only(),
+            )
+
+        # ── STOP ALL ──
         elif data == "xa":
-            await db.set_group_active_for_user(uid, False)
-            await refresh_cache_for_user(uid)
-            await cb.answer("⏹ Sab groups band ho gaye!", show_alert=True)
-            return
+            await cb.message.edit_text(
+                "⏹ *Stop All Tasks?*",
+                parse_mode="Markdown",
+                reply_markup=kb_stopall_confirm(),
+            )
+
+        elif data == "xac":
+            await db.set_all_tasks_active(uid, False)
+            await cb.message.edit_text("⏹ *Saare tasks band ho gaye!*", parse_mode="Markdown", reply_markup=kb_main_only())
+
+        elif data == "scx":
+            await cb.message.edit_text("✅ Cancel ho gaya.", reply_markup=kb_main_only())
+
+        # ── REFER & EARN ──
+        elif data == "ref":
+            aff = await db.get_or_create_affiliate(uid)
+            from config import MAIN_BOT_USERNAME
+            link = f"t.me/{MAIN_BOT_USERNAME}?start={aff.code}"
+            await cb.message.edit_text(
+                f"👥 *Refer & Earn*\n\n"
+                f"Tera referral code: `{aff.code}`\n"
+                f"Link: `{link}`\n\n"
+                f"Commission: 80% — sirf pehli payment pe\n"
+                f"_(Renewal pe commission nahi milti)_\n\n"
+                f"Referred: {aff.total_referred} log\n"
+                f"Total Kamaaye: ${aff.total_earned_usd:.2f}\n"
+                f"Withdraw kar sakta hai: ${aff.balance_usd:.2f}\n"
+                f"Minimum: ${AFFILIATE_MIN_WITHDRAW_USD}",
+                parse_mode="Markdown",
+                reply_markup=kb_refer(
+                    aff.code, aff.balance_usd, aff.total_earned_usd,
+                    aff.total_referred, MAIN_BOT_USERNAME,
+                ),
+            )
 
         try:
             await cb.answer()
