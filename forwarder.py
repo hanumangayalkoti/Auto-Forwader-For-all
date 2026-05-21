@@ -1,6 +1,6 @@
-import os
 import asyncio
 import logging
+import os
 import tempfile
 from typing import Optional
 
@@ -8,12 +8,10 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel as TLChannel, Chat as TLChat, User as TLUser
 
-from config import API_ID, API_HASH
-from database import (
-    get_all_sessions, save_session, delete_session,
-    get_user_groups, get_channels, get_all_active_groups,
-    set_group_active, set_group_active_for_user,
-)
+from config import API_ID, API_HASH, FORWARD_DELAY, FAIL_NOTIFY_THRESHOLD, get_plan_limits
+from filters import should_skip, build_modified_text, build_modified_caption
+from image_tools import add_watermark, is_image_bytes
+import database as db
 
 logger = logging.getLogger(__name__)
 
@@ -23,26 +21,20 @@ user_clients: dict[int, TelegramClient] = {}
 # user_id → [(chat_id, name), ...]
 user_dialogs: dict[int, list[tuple[int, str]]] = {}
 
-# In-memory active group cache: user_id → [{group_id, incoming_ids, outgoing_ids}]
-_group_cache: dict[int, list[dict]] = {}
-
-# Bot reference for user error notifications
+# Bot reference for notifications
 _bot_ref: Optional[object] = None
 
-# Track which clients already have a handler registered (prevents duplicate forwarding)
+# Track which clients have handler registered
 _handler_registered: set[int] = set()
 
-# Track consecutive failures per (user_id, group_id, target_id)
+# Consecutive fail counter: (user_id, task_id, target_id) → count
 _fail_counts: dict[str, int] = {}
-FAIL_NOTIFY_THRESHOLD = 3
 
-DIALOG_LIMIT = 100
-DIALOG_LIMIT_FALLBACK = 30   # agar 100 fail ho toh ye try karo
-DIALOG_TIMEOUT = 25          # seconds — itne time mein na aaye toh fail
-FORWARD_DELAY = 0.4
+# Login flow clients: user_id → TelegramClient (not yet saved)
+_login_clients: dict[int, TelegramClient] = {}
 
 
-def set_bot(bot) -> None:
+def set_bot(bot):
     global _bot_ref
     _bot_ref = bot
 
@@ -54,307 +46,38 @@ def _normalize_id(entity) -> int:
         return -entity.id
     elif isinstance(entity, TLUser):
         return entity.id
-    return getattr(entity, 'id', 0)
+    return getattr(entity, "id", 0)
 
 
-# FIX: BytesIO ki jagah temp file use karo — badi files ke liye "file parts invalid" error fix
-async def _copy_with_download(client: TelegramClient, target_id: int, message):
-    suffix = ""
-    if message.file and message.file.name:
-        _, suffix = os.path.splitext(message.file.name)
-    if not suffix and message.file and message.file.mime_type:
-        mime_map = {
-            "video/mp4": ".mp4", "video/mpeg": ".mpeg", "video/quicktime": ".mov",
-            "audio/mpeg": ".mp3", "audio/ogg": ".ogg", "audio/flac": ".flac",
-            "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
-            "image/webp": ".webp", "application/pdf": ".pdf",
-        }
-        suffix = mime_map.get(message.file.mime_type, "")
+# ══════════════════════════════════════════════
+# LOGIN FLOW
+# ══════════════════════════════════════════════
 
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp_path = tmp.name
-        await message.download_media(file=tmp_path)
-        await client.send_file(
-            target_id,
-            file=tmp_path,
-            caption=message.message or "",
-            force_document=False,
-        )
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-
-
-async def _refresh_group_cache(uid: int):
-    groups = await get_user_groups(uid)
-    cache = []
-    for g in groups:
-        if not g.is_active:
-            continue
-        inc = {ch.channel_id for ch in g.channels if ch.type == "incoming"}
-        out = [ch.channel_id for ch in g.channels if ch.type == "outgoing"]
-        if inc and out:
-            cache.append({"id": g.id, "name": g.name, "incoming": inc, "outgoing": out})
-    _group_cache[uid] = cache
-
-
-async def _notify_user_error(uid: int, grp_name: str, tgt_id: int, err_msg: str):
-    """User ko bot message bhejo jab forwarding fail ho — threshold ke baad."""
-    if not _bot_ref:
-        return
-    fail_key = f"{uid}:{tgt_id}"
-    count = _fail_counts.get(fail_key, 0) + 1
-    _fail_counts[fail_key] = count
-
-    if count == FAIL_NOTIFY_THRESHOLD:
-        try:
-            await _bot_ref.send_message(
-                uid,
-                f"⚠️ *Forwarding Error*\n\n"
-                f"Group: *{grp_name}*\n"
-                f"Target ID: `{tgt_id}`\n\n"
-                f"*Error:* {err_msg}\n\n"
-                "Possible reasons:\n"
-                "— Bot/account ko target chat se hata diya gaya\n"
-                "— Send permission revoke ho gayi\n"
-                "— Account temporarily restricted hai\n\n"
-                "Fix karne ke baad /groups se group restart karo.",
-                parse_mode="Markdown",
-            )
-        except Exception as notify_err:
-            logger.warning(f"[Forwarder] User {uid} ko notify nahi kar sake: {notify_err}")
-
-
-def _make_handler(uid: int, client: TelegramClient):
-    client_id = id(client)
-    if client_id in _handler_registered:
-        return
-    _handler_registered.add(client_id)
-
-    @client.on(events.NewMessage)
-    async def forwarder(event):
-        cached = _group_cache.get(uid, [])
-        for grp in cached:
-            if event.chat_id not in grp["incoming"]:
-                continue
-            for tgt_id in grp["outgoing"]:
-                fail_key = f"{uid}:{tgt_id}"
-                try:
-                    m = event.message
-
-                    # FIX: Forwarding strategy — 3 levels:
-                    # 1. forward_messages() — Telegram ka native forward, sabse reliable
-                    #    koi download/upload nahi, media type kuch bhi ho chalega
-                    # 2. send_file(m.media) — agar forward block ho (e.g. no-forward channel)
-                    # 3. _copy_with_download() — last resort, temp file se (BytesIO wala bug fix)
-
-                    forwarded = False
-
-                    # Level 1: Native forward
-                    try:
-                        await client.forward_messages(tgt_id, m)
-                        forwarded = True
-                    except Exception as fwd_err:
-                        logger.debug(
-                            f"[Forward L1] user={uid} grp={grp['name']} → {tgt_id}: "
-                            f"native forward failed ({fwd_err}), trying L2"
-                        )
-
-                    # Level 2: send_file with media object (text message bhi handle karo)
-                    if not forwarded:
-                        if m.media:
-                            try:
-                                await client.send_file(tgt_id, file=m.media, caption=m.message or "")
-                                forwarded = True
-                            except Exception as sf_err:
-                                logger.debug(
-                                    f"[Forward L2] user={uid} grp={grp['name']} → {tgt_id}: "
-                                    f"send_file failed ({sf_err}), trying L3"
-                                )
-                        elif m.message:
-                            await client.send_message(tgt_id, m.message)
-                            forwarded = True
-
-                    # Level 3: Download to temp file and re-upload
-                    if not forwarded and m.media:
-                        await _copy_with_download(client, tgt_id, m)
-                        forwarded = True
-
-                    if forwarded:
-                        _fail_counts.pop(fail_key, None)
-
-                    await asyncio.sleep(FORWARD_DELAY)
-
-                except Exception as err:
-                    err_str = str(err)
-                    if hasattr(err, 'seconds'):
-                        wait = err.seconds + 5
-                        logger.warning(f"[FloodWait] user={uid} waiting {wait}s")
-                        await asyncio.sleep(wait)
-                    else:
-                        logger.error(
-                            f"[Forward Error] user={uid} grp={grp['name']} → {tgt_id}: {err_str}"
-                        )
-                        await _notify_user_error(uid, grp["name"], tgt_id, err_str)
-
-    return forwarder
-
-
-async def _fetch_and_parse_dialogs(client: TelegramClient, uid: int, limit: int) -> list[tuple[int, str]]:
-    """Dialogs fetch karo aur parse karo — alag function taaki retry easy ho."""
-    all_dialogs = await asyncio.wait_for(
-        client.get_dialogs(limit=limit),
-        timeout=DIALOG_TIMEOUT,
-    )
-    pinned = [d for d in all_dialogs if d.pinned]
-    non_pinned = [d for d in all_dialogs if not d.pinned]
-    sorted_dialogs = pinned + non_pinned
-
-    result = []
-    for d in sorted_dialogs:
-        try:
-            entity = d.entity
-            name = (
-                getattr(entity, 'title', None)
-                or getattr(entity, 'first_name', None)
-                or d.name
-                or "Unnamed"
-            )
-            chat_id = _normalize_id(entity)
-            if chat_id != 0:
-                pin_mark = "📌 " if d.pinned else ""
-                result.append((chat_id, pin_mark + name))
-        except Exception as e:
-            logger.debug(f"[Dialog Load] user={uid}: Skipping dialog: {e}")
-            continue
-
-    logger.info(
-        f"[Dialog Load] user={uid}: Loaded {len(result)} dialogs "
-        f"(limit={limit}, pinned={len(pinned)})"
-    )
-    return result
-
-
-async def load_dialogs(uid: int) -> list[tuple[int, str]]:
-    client = user_clients.get(uid)
-
-    # Client nahi mila — DB se session lekar reconnect try karo
-    if not client:
-        logger.warning(f"[Dialog Load] user={uid}: No client in memory, attempting DB reconnect...")
-        try:
-            session_str = await load_session(uid)
-            if session_str:
-                reconnected = await connect_user(uid, session_str)
-                if reconnected:
-                    # connect_user ke andar load_dialogs already call hoti hai
-                    # toh cached result return karo — dobara load mat karo
-                    cached = user_dialogs.get(uid, [])
-                    logger.info(
-                        f"[Dialog Load] user={uid}: Reconnected from DB. "
-                        f"Dialogs from cache: {len(cached)}"
-                    )
-                    return cached
-                else:
-                    logger.error(
-                        f"[Dialog Load] user={uid}: DB reconnect failed — "
-                        "session expired ya revoked hai. User ko /logout → /login karna hoga."
-                    )
-                    return []
-            else:
-                logger.error(f"[Dialog Load] user={uid}: No session in DB — user ne login nahi kiya.")
-                return []
-        except Exception as reconnect_err:
-            logger.error(f"[Dialog Load] user={uid}: Reconnect exception: {reconnect_err}")
-            return []
-
-    if not client:
-        return []
-
-    if not client.is_connected():
-        try:
-            await client.connect()
-        except Exception as err:
-            logger.error(f"[Dialog Load] user={uid}: Connect failed: {err}")
-            return user_dialogs.get(uid, [])
-
-    # Pehle DIALOG_LIMIT (100) se try karo, fail ho toh DIALOG_LIMIT_FALLBACK (30) se
-    for limit in (DIALOG_LIMIT, DIALOG_LIMIT_FALLBACK):
-        try:
-            result = await _fetch_and_parse_dialogs(client, uid, limit)
-            user_dialogs[uid] = result
-            return result
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"[Dialog Load] user={uid}: get_dialogs(limit={limit}) timeout "
-                f"({DIALOG_TIMEOUT}s). "
-                + ("Retrying with smaller limit..." if limit == DIALOG_LIMIT else "Giving up.")
-            )
-        except Exception as err:
-            logger.error(f"[Dialog Load Error] user={uid} (limit={limit}): {err}")
-            if limit == DIALOG_LIMIT_FALLBACK:
-                break
-
-    # Dono fail — cached value rakhte hain agar kuch tha, warna []
-    return user_dialogs.get(uid, [])
-
-
-async def connect_user(uid: int, session_string: str) -> bool:
-    try:
-        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-        await client.connect()
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            return False
-        user_clients[uid] = client
-        _make_handler(uid, client)
-        await load_dialogs(uid)
-        await _refresh_group_cache(uid)
-        logger.info(f"[Forwarder] User {uid} connected. Dialogs: {len(user_dialogs.get(uid, []))}")
-        return True
-    except Exception as err:
-        logger.error(f"[Connect Error] user={uid}: {err}")
-        return False
-
-
-async def create_client_for_login(uid: int) -> TelegramClient:
-    if uid in user_clients:
-        old_client = user_clients[uid]
-        _handler_registered.discard(id(old_client))
-        try:
-            await old_client.disconnect()
-        except Exception:
-            pass
+async def create_client_for_login(user_id: int) -> TelegramClient:
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
-    user_clients[uid] = client
+    _login_clients[user_id] = client
     return client
 
 
-async def finalize_login(uid: int) -> Optional[str]:
-    client = user_clients.get(uid)
+async def finalize_login(user_id: int) -> bool:
+    """After successful OTP/2FA — save session, register handler."""
+    client = _login_clients.pop(user_id, None)
     if not client:
-        return None
-    try:
-        session_string = client.session.save()
-        await save_session(uid, session_string)
-        _make_handler(uid, client)
-        await load_dialogs(uid)
-        await _refresh_group_cache(uid)
-        return session_string
-    except Exception as err:
-        logger.error(f"[Finalize Login Error] user={uid}: {err}")
-        return None
+        return False
+    session_string = client.session.save()
+    await db.save_session(user_id, session_string)
+    user_clients[user_id] = client
+    await _load_dialogs(user_id)
+    await _register_handler(user_id)
+    return True
 
 
-async def logout_user(uid: int):
-    client = user_clients.get(uid)
+async def logout_user(user_id: int):
+    client = user_clients.pop(user_id, None)
+    _handler_registered.discard(user_id)
+    user_dialogs.pop(user_id, None)
     if client:
-        _handler_registered.discard(id(client))
         try:
             await client.log_out()
         except Exception:
@@ -363,188 +86,359 @@ async def logout_user(uid: int):
             await client.disconnect()
         except Exception:
             pass
-        del user_clients[uid]
-    if uid in user_dialogs:
-        del user_dialogs[uid]
-    _group_cache.pop(uid, None)
-    _fail_counts_clear_user(uid)
-    await delete_session(uid)
+    await db.delete_session(user_id)
+    await db.set_all_tasks_active(user_id, False)
 
 
-def _fail_counts_clear_user(uid: int):
-    prefix = f"{uid}:"
-    keys_to_del = [k for k in _fail_counts if k.startswith(prefix)]
-    for k in keys_to_del:
-        del _fail_counts[k]
+def is_user_logged_in(user_id: int) -> bool:
+    return user_id in user_clients and user_clients[user_id].is_connected()
 
 
-async def is_user_logged_in(uid: int) -> bool:
-    client = user_clients.get(uid)
+# ══════════════════════════════════════════════
+# DIALOGS
+# ══════════════════════════════════════════════
+
+async def load_dialogs(user_id: int) -> list[tuple[int, str]]:
+    await _load_dialogs(user_id)
+    return user_dialogs.get(user_id, [])
+
+
+async def _load_dialogs(user_id: int):
+    client = user_clients.get(user_id)
     if not client:
-        return False
+        return
     try:
-        if not client.is_connected():
-            await client.connect()
-        return await client.is_user_authorized()
-    except Exception:
-        return False
+        dialogs = await asyncio.wait_for(
+            client.get_dialogs(limit=100),
+            timeout=25,
+        )
+        result = []
+        for d in dialogs:
+            eid = _normalize_id(d.entity)
+            name = d.name or str(eid)
+            result.append((eid, name))
+        user_dialogs[user_id] = result
+    except asyncio.TimeoutError:
+        try:
+            dialogs = await asyncio.wait_for(
+                client.get_dialogs(limit=30),
+                timeout=15,
+            )
+            result = []
+            for d in dialogs:
+                eid = _normalize_id(d.entity)
+                name = d.name or str(eid)
+                result.append((eid, name))
+            user_dialogs[user_id] = result
+        except Exception as e:
+            logger.error(f"[Forwarder] Dialog load failed for user {user_id}: {e}")
+    except Exception as e:
+        logger.error(f"[Forwarder] Dialog load error user {user_id}: {e}")
 
+
+async def resolve_channel(user_id: int, identifier: str) -> Optional[tuple[int, str]]:
+    """
+    Resolve a channel by @username or https://t.me/... link.
+    Returns (channel_id, name) or None.
+    """
+    client = user_clients.get(user_id)
+    if not client:
+        return None
+    try:
+        entity = await client.get_entity(identifier)
+        eid = _normalize_id(entity)
+        name = getattr(entity, "title", None) or getattr(entity, "username", None) or str(eid)
+        # Add to dialogs cache
+        dialogs = user_dialogs.get(user_id, [])
+        if not any(d[0] == eid for d in dialogs):
+            dialogs.insert(0, (eid, name))
+            user_dialogs[user_id] = dialogs
+        return eid, name
+    except Exception as e:
+        logger.warning(f"[Forwarder] resolve_channel failed '{identifier}': {e}")
+        return None
+
+
+# ══════════════════════════════════════════════
+# STARTUP RECONNECT
+# ══════════════════════════════════════════════
 
 async def startup_connect_all():
-    sessions = await get_all_sessions()
-    logger.info(f"[Forwarder] Found {len(sessions)} saved sessions. Connecting...")
-    tasks = [connect_user(uid, sess) for uid, sess in sessions]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    ok = sum(1 for r in results if r is True)
-    logger.info(f"[Forwarder] Connected {ok}/{len(sessions)} users.")
-
-
-async def reconnect_all_disconnected() -> dict:
-    sessions = await get_all_sessions()
-    stats = {"checked": len(sessions), "ok": 0, "reconnected": 0, "failed": 0}
-
-    for uid, session_string in sessions:
-        client = user_clients.get(uid)
-
-        still_alive = False
-        if client:
-            try:
-                if not client.is_connected():
-                    await client.connect()
-                still_alive = await client.is_user_authorized()
-            except Exception:
-                still_alive = False
-
-        if still_alive:
-            if uid not in _group_cache:
-                await _refresh_group_cache(uid)
-            stats["ok"] += 1
-            continue
-
-        if client:
-            _handler_registered.discard(id(client))
-            try:
+    sessions = await db.get_all_sessions()
+    for sess in sessions:
+        try:
+            session_string = db._decrypt(sess.session_string)
+            client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+            await client.connect()
+            if await client.is_user_authorized():
+                user_clients[sess.user_id] = client
+                await _load_dialogs(sess.user_id)
+                await _register_handler(sess.user_id)
+                logger.info(f"[Forwarder] Reconnected user {sess.user_id}")
+            else:
                 await client.disconnect()
+                logger.warning(f"[Forwarder] Session unauthorized: user {sess.user_id}")
+        except Exception as e:
+            logger.error(f"[Forwarder] Reconnect failed for user {sess.user_id}: {e}")
+
+
+# ══════════════════════════════════════════════
+# HANDLER REGISTRATION
+# ══════════════════════════════════════════════
+
+async def _register_handler(user_id: int):
+    if user_id in _handler_registered:
+        return
+    client = user_clients.get(user_id)
+    if not client:
+        return
+
+    @client.on(events.NewMessage())
+    async def _on_message(event):
+        await _process_message(user_id, event)
+
+    _handler_registered.add(user_id)
+
+
+async def refresh_cache_for_user(user_id: int):
+    """Called after task changes — reload active task cache."""
+    pass   # Cache is loaded fresh from DB on each forward
+
+
+# ══════════════════════════════════════════════
+# FORWARD PROCESSING
+# ══════════════════════════════════════════════
+
+async def _process_message(user_id: int, event):
+    try:
+        message = event.message
+        if not message:
+            return
+
+        source_id = _normalize_id(event.chat)
+        tasks = await db.get_user_tasks(user_id)
+
+        for task in tasks:
+            if not task.is_active:
+                continue
+
+            source_ids = {ch.channel_id for ch in task.channels if ch.type == "source"}
+            target_ids = [ch.channel_id for ch in task.channels if ch.type == "target"]
+
+            if source_id not in source_ids:
+                continue
+            if not target_ids:
+                continue
+
+            # ── Plan limits ──
+            user = await db.get_user(user_id)
+            if not user:
+                continue
+
+            _, access_reason = db.check_access(user)
+            plan = user.plan
+
+            # Free plan: daily message limit
+            limits = get_plan_limits(plan)
+            if limits["msgs_per_day"] > 0:
+                count = await db.increment_daily_count(user_id)
+                if count > limits["msgs_per_day"]:
+                    # Limit hit — skip silently
+                    continue
+
+            # ── Skip duplicates ──
+            if task.skip_duplicates:
+                already = await db.is_message_forwarded(task.id, source_id, message.id)
+                if already:
+                    continue
+
+            # ── Filters ──
+            skip, reason = should_skip(task, message)
+            if skip:
+                continue
+
+            # ── Delay ──
+            await _apply_delay(task)
+
+            # ── Schedule check ──
+            if task.schedule_enabled:
+                if not _in_schedule_window(task):
+                    if task.schedule_miss_action == "queue":
+                        await db.message_queue_add(task.id, source_id, message.id)
+                    continue
+
+            # ── Forward to each target ──
+            for target_id in target_ids:
+                await _forward_one(user_id, task, message, target_id, source_id)
+
+            # ── Mark forwarded ──
+            if task.skip_duplicates:
+                await db.mark_message_forwarded(task.id, source_id, message.id)
+
+    except Exception as e:
+        logger.error(f"[Forwarder] _process_message error user {user_id}: {e}", exc_info=True)
+
+
+async def _forward_one(user_id: int, task, message, target_id: int, source_id: int):
+    client = user_clients.get(user_id)
+    if not client:
+        return
+
+    fail_key = f"{user_id}:{task.id}:{target_id}"
+    try:
+        await _do_forward(client, task, message, target_id)
+        _fail_counts.pop(fail_key, None)
+        await asyncio.sleep(FORWARD_DELAY)
+
+    except Exception as e:
+        count = _fail_counts.get(fail_key, 0) + 1
+        _fail_counts[fail_key] = count
+        logger.warning(f"[Forwarder] Forward fail #{count} task={task.id} target={target_id}: {e}")
+
+        if count >= FAIL_NOTIFY_THRESHOLD and _bot_ref:
+            _fail_counts[fail_key] = 0
+            try:
+                await _bot_ref.send_message(
+                    user_id,
+                    f"⚠️ *Forward Error*\n\n"
+                    f"Task: *{task.name}*\n"
+                    f"Target channel ID: `{target_id}`\n"
+                    f"Error: {str(e)[:200]}\n\n"
+                    f"Task continue kar raha hai.",
+                    parse_mode="Markdown",
+                )
             except Exception:
                 pass
-            user_clients.pop(uid, None)
-            _group_cache.pop(uid, None)
-
-        logger.info(f"[Reconnect] user={uid} reconnecting...")
-        try:
-            success = await connect_user(uid, session_string)
-            if success:
-                stats["reconnected"] += 1
-                logger.info(f"[Reconnect] user={uid} reconnected successfully.")
-                if _group_cache.get(uid):
-                    if _bot_ref:
-                        try:
-                            await _bot_ref.send_message(
-                                uid,
-                                "🔄 *Forwarding Reconnected*\n\n"
-                                "Connection drop hone ke baad automatically reconnect ho gaya.\n"
-                                "Forwarding phir se chal rahi hai!",
-                                parse_mode="Markdown",
-                            )
-                        except Exception:
-                            pass
-            else:
-                stats["failed"] += 1
-                logger.warning(f"[Reconnect] user={uid} reconnect failed — session may be expired.")
-        except Exception as err:
-            stats["failed"] += 1
-            logger.error(f"[Reconnect] user={uid} error: {err}")
-
-    logger.info(
-        f"[Reconnect] Done — checked={stats['checked']} ok={stats['ok']} "
-        f"reconnected={stats['reconnected']} failed={stats['failed']}"
-    )
-    return stats
 
 
-async def stop_all_for_user(uid: int):
-    await set_group_active_for_user(uid, False)
-    _group_cache.pop(uid, None)
+async def _do_forward(client: TelegramClient, task, message, target_id: int):
+    """Core forward logic — no 'Forwarded from' tag."""
+    replacers = task.link_replacers or []
+    has_media = message.media is not None
+    original_text = message.text or ""
+    original_caption = message.caption or ""
+
+    if not has_media:
+        # Text message
+        new_text = build_modified_text(task, original_text, replacers)
+        if new_text.strip():
+            await client.send_message(target_id, new_text)
+    else:
+        # Media message
+        new_caption = build_modified_caption(task, original_caption, replacers)
+
+        # Check if watermark needed (Business plan)
+        apply_wm = task.watermark_enabled and task.watermark_text
+
+        if apply_wm:
+            await _forward_with_watermark(client, task, message, target_id, new_caption)
+        else:
+            await _copy_media(client, message, target_id, new_caption)
 
 
-async def refresh_cache_for_user(uid: int):
-    await _refresh_group_cache(uid)
-
-
-async def get_client(uid: int) -> Optional[TelegramClient]:
-    return user_clients.get(uid)
-
-
-async def check_is_member(uid: int, channel_id: int) -> tuple[bool, str]:
-    """Verify the Telethon account can read messages from this channel (is joined)."""
-    client = user_clients.get(uid)
-    if not client:
-        return False, "no_client"
-    entity = None
+async def _copy_media(client: TelegramClient, message, target_id: int, caption: str):
+    """Download and re-upload media without forward tag."""
+    suffix = _guess_suffix(message)
+    tmp_path = None
     try:
-        entity = await client.get_entity(channel_id)
-        name = getattr(entity, "title", None) or getattr(entity, "first_name", str(channel_id))
-        await client.get_messages(entity, limit=1)
-        return True, name
-    except Exception as e:
-        err = str(e)
-        entity_name = getattr(entity, 'title', str(channel_id)) if entity is not None else str(channel_id)
-        if "private" in err.lower() or "access" in err.lower() or "invite" in err.lower():
-            return False, "private_channel"
-        return False, f"error:{entity_name}"
-
-
-async def check_can_post(uid: int, channel_id: int) -> tuple[bool, str]:
-    """
-    Verify the Telethon account can send messages in this chat.
-    Returns (True, name) or (False, "error_type:name").
-
-    Error types:
-      not_member:<name>              — not joined
-      no_permission_channel:<name>   — broadcast channel, not admin/editor
-      no_permission:<name>           — group restricted, no send right
-      error:<name>:<msg>             — other error
-    """
-    client = user_clients.get(uid)
-    if not client:
-        return False, "no_client"
-    entity = None
-    try:
-        entity = await client.get_entity(channel_id)
-        name = (
-            getattr(entity, "title", None)
-            or getattr(entity, "first_name", str(channel_id))
-            or str(channel_id)
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+        await message.download_media(file=tmp_path)
+        await client.send_file(
+            target_id,
+            tmp_path,
+            caption=caption or None,
         )
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
-        if isinstance(entity, TLChannel):
-            if entity.broadcast:
-                if getattr(entity, 'creator', False):
-                    return True, name
-                admin_rights = getattr(entity, 'admin_rights', None)
-                if admin_rights and getattr(admin_rights, 'post_messages', False):
-                    return True, name
-                perms = await client.get_permissions(entity)
-                if not getattr(perms, 'post_messages', False):
-                    return False, f"no_permission_channel:{name}"
-            else:
-                if getattr(entity, 'creator', False):
-                    return True, name
-                perms = await client.get_permissions(entity)
-                if not getattr(perms, 'send_messages', True):
-                    return False, f"no_permission:{name}"
-        elif isinstance(entity, TLChat):
-            perms = await client.get_permissions(entity)
-            if not getattr(perms, 'send_messages', True):
-                return False, f"no_permission:{name}"
 
-        return True, name
+async def _forward_with_watermark(client: TelegramClient, task, message, target_id: int, caption: str):
+    """Download image, apply watermark, re-upload."""
+    tmp_path = None
+    wm_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = tmp.name
+        await message.download_media(file=tmp_path)
 
-    except Exception as e:
-        err = str(e)
-        entity_name = getattr(entity, 'title', str(channel_id)) if entity is not None else str(channel_id)
-        if "not a member" in err.lower() or "kicked" in err.lower() or "banned" in err.lower():
-            return False, f"not_member:{entity_name}"
-        if "private" in err.lower() or "access" in err.lower():
-            return False, f"not_member:{entity_name}"
-        return False, f"error:{entity_name}:{err}"
+        with open(tmp_path, "rb") as f:
+            image_bytes = f.read()
+
+        if is_image_bytes(image_bytes):
+            wm_bytes = add_watermark(
+                image_bytes,
+                text=task.watermark_text,
+                position=task.watermark_position or "bottom_right",
+            )
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp2:
+                wm_path = tmp2.name
+                tmp2.write(wm_bytes)
+
+            await client.send_file(target_id, wm_path, caption=caption or None)
+        else:
+            # Not an image — forward without watermark
+            await client.send_file(target_id, tmp_path, caption=caption or None)
+
+    finally:
+        for path in [tmp_path, wm_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
+
+
+def _guess_suffix(message) -> str:
+    if message.file and message.file.name:
+        _, ext = os.path.splitext(message.file.name)
+        if ext:
+            return ext
+    if message.file and message.file.mime_type:
+        mime_map = {
+            "video/mp4": ".mp4", "video/mpeg": ".mpeg",
+            "audio/mpeg": ".mp3", "audio/ogg": ".ogg",
+            "image/jpeg": ".jpg", "image/png": ".png",
+            "image/gif": ".gif", "image/webp": ".webp",
+            "application/pdf": ".pdf",
+        }
+        return mime_map.get(message.file.mime_type, "")
+    return ""
+
+
+def _in_schedule_window(task) -> bool:
+    """Check if current IST time is within the task's schedule window."""
+    from datetime import datetime, timezone, timedelta
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(IST)
+
+    if task.schedule_days:
+        allowed_days = [int(d) for d in task.schedule_days.split(",") if d.strip()]
+        if now.weekday() not in allowed_days:
+            return False
+
+    if task.schedule_start and task.schedule_end:
+        try:
+            sh, sm = map(int, task.schedule_start.split(":"))
+            eh, em = map(int, task.schedule_end.split(":"))
+            start_minutes = sh * 60 + sm
+            end_minutes = eh * 60 + em
+            now_minutes = now.hour * 60 + now.minute
+            if not (start_minutes <= now_minutes <= end_minutes):
+                return False
+        except Exception:
+            pass
+
+    return True
+
+
+async def _apply_delay(task):
+    if task.delay_mode == "fixed" and task.delay_seconds > 0:
+        await asyncio.sleep(task.delay_seconds)
+    elif task.delay_mode == "random":
+        import random
+        mn = task.delay_random_min or 0
+        mx = task.delay_random_max or 0
+        if mx > mn:
+            await asyncio.sleep(random.uniform(mn, mx))
