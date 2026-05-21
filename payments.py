@@ -9,12 +9,11 @@ from aiohttp import web
 
 from config import (
     RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET,
-    SUBSCRIPTION_PRICE, SUBSCRIPTION_DAYS
+    PLAN_INFO, USD_TO_INR,
 )
-from database import create_payment, confirm_payment, extend_subscription
+import database as db
 
 logger = logging.getLogger(__name__)
-
 bot_instance = None
 
 
@@ -27,18 +26,37 @@ def _get_client() -> razorpay.Client:
     return razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
 
-async def create_order(user_id: int) -> tuple[str, str]:
-    amount_paise = int(SUBSCRIPTION_PRICE * 100)  # Razorpay paise mein leta hai
+async def create_order(
+    user_id: int, plan: str, billing: str
+) -> tuple[str, str, int, float]:
+    """
+    Returns (order_id, payment_link_url, amount_inr_paise, amount_usd)
+    billing: 'monthly' | 'annual'
+    """
+    info = PLAN_INFO[plan]
+    if billing == "annual":
+        amount_usd = info["annual_usd"]
+        amount_inr = info["annual_inr"]
+    else:
+        amount_usd = info["monthly_usd"]
+        amount_inr = info["monthly_inr"]
+
+    amount_paise = amount_inr * 100   # Razorpay paise mein
+
+    plan_label = info["name"]
+    billing_label = "Monthly" if billing == "monthly" else "Annual"
 
     payload = {
         "amount": amount_paise,
         "currency": "INR",
-        "description": "DealsKoti Bot — 30 din ka access",
+        "description": f"Forward Bot — {plan_label} {billing_label}",
         "customer": {
             "name": f"User {user_id}",
         },
         "notes": {
             "user_id": str(user_id),
+            "plan": plan,
+            "billing": billing,
         },
         "reminder_enable": False,
     }
@@ -53,88 +71,107 @@ async def create_order(user_id: int) -> tuple[str, str]:
         logger.error(f"[Razorpay] Payment link create failed: {data}")
         raise Exception(f"Razorpay link create error: {data}")
 
-    await create_payment(user_id, link_id, amount_paise)
-    return link_id, link_url
+    await db.create_payment(user_id, link_id, plan, billing, amount_paise, amount_usd)
+    return link_id, link_url, amount_paise, amount_usd
 
 
 async def webhook_handler(request: web.Request) -> web.Response:
     body = await request.read()
+    sig = request.headers.get("X-Razorpay-Signature", "")
 
-    # Signature verify karo
-    signature = request.headers.get("X-Razorpay-Signature", "")
-    if RAZORPAY_WEBHOOK_SECRET and signature:
-        expected = hmac.new(
-            RAZORPAY_WEBHOOK_SECRET.encode(),
-            body,
-            hashlib.sha256,
-        ).hexdigest()
-        if not hmac.compare_digest(expected, signature):
-            logger.warning("[Webhook] Invalid signature — request reject.")
-            return web.Response(status=200, text="ok")
+    expected = hmac.new(
+        RAZORPAY_WEBHOOK_SECRET.encode(),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected, sig):
+        logger.warning("[Razorpay] Webhook signature mismatch")
+        return web.Response(status=400, text="Bad signature")
 
     try:
-        data = json.loads(body)
+        payload = json.loads(body)
     except Exception:
-        return web.Response(status=200, text="ok")
+        return web.Response(status=400, text="Bad JSON")
 
-    event = data.get("event", "")
-    logger.info(f"[Webhook] Event received: {event}")
+    event = payload.get("event", "")
 
-    # Sirf ye dono events handle karo
-    if event not in ("payment_link.paid", "payment.captured"):
-        return web.Response(status=200, text="ok")
+    if event == "payment_link.paid":
+        await _handle_payment_paid(payload)
+    elif event == "payment.failed":
+        logger.info("[Razorpay] Payment failed event received")
 
+    return web.Response(text="OK")
+
+
+async def _handle_payment_paid(payload: dict):
     try:
-        payload = data.get("payload", {})
+        pl = payload["payload"]["payment_link"]["entity"]
+        payment_entity = payload["payload"]["payment"]["entity"]
+        order_id = pl["id"]
+        payment_id = payment_entity["id"]
+        notes = pl.get("notes", {})
+        user_id = int(notes.get("user_id", 0))
+        plan = notes.get("plan", "basic")
+        billing = notes.get("billing", "monthly")
 
-        if event == "payment_link.paid":
-            link_entity = payload.get("payment_link", {}).get("entity", {})
-            payment_entity = payload.get("payment", {}).get("entity", {})
-            link_id = link_entity.get("id", "")
-            payment_id = str(payment_entity.get("id", ""))
-            notes = link_entity.get("notes", {})
+        if not user_id:
+            logger.error("[Razorpay] user_id missing in webhook notes")
+            return
 
-        else:  # payment.captured
-            payment_entity = payload.get("payment", {}).get("entity", {})
-            payment_id = str(payment_entity.get("id", ""))
-            notes = payment_entity.get("notes", {})
-            # payment.captured mein link_id nahi hota, order_id use karo
-            link_id = str(payment_entity.get("order_id", "") or payment_entity.get("invoice_id", ""))
+        payment = await db.confirm_payment(order_id, payment_id)
+        if not payment:
+            logger.error(f"[Razorpay] Payment not found in DB: {order_id}")
+            return
 
-        user_id_str = notes.get("user_id", "")
-        logger.info(f"[Webhook] link_id={link_id} payment_id={payment_id} user_id={user_id_str}")
+        info = PLAN_INFO[plan]
+        days = info["days_annual"] if billing == "annual" else info["days_monthly"]
 
-        if not link_id:
-            logger.warning("[Webhook] link_id nahi mila — skip.")
-            return web.Response(status=200, text="ok")
+        await db.set_user_plan(user_id, plan, days)
 
-        uid = await confirm_payment(link_id, payment_id)
-        if uid:
-            await extend_subscription(uid, SUBSCRIPTION_DAYS)
-            logger.info(f"[Webhook] Subscription extended for user {uid}")
-            if bot_instance:
-                try:
-                    await bot_instance.send_message(
-                        uid,
-                        "✅ *Payment Successful!*\n\n"
-                        "₹69 receive ho gaya.\n"
-                        "30 din ka access mil gaya hai!\n\n"
-                        "Ab /start karo aur forwarding enjoy karo! 🎉",
-                        parse_mode="Markdown",
-                    )
-                except Exception as msg_err:
-                    logger.warning(f"[Webhook] Message send failed for {uid}: {msg_err}")
-        else:
-            logger.warning(f"[Webhook] confirm_payment ne None return kiya for link_id={link_id}")
+        # Affiliate commission (first payment only)
+        if payment.is_first_payment:
+            user = await db.get_user(user_id)
+            if user and user.referred_by:
+                commission = await db.credit_affiliate_commission(
+                    user.referred_by, payment.amount_usd
+                )
+                if bot_instance:
+                    try:
+                        await bot_instance.send_message(
+                            user.referred_by,
+                            f"🎉 *Referral Commission!*\n\n"
+                            f"Tumhare referral ne subscribe kiya!\n"
+                            f"*+${commission:.2f}* tumhare wallet mein add ho gaya!\n\n"
+                            f"_Note: Commission sirf pehli payment pe milti hai._",
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
 
-    except Exception as err:
-        logger.exception(f"[Webhook Error] {err}")
+        # Notify user
+        if bot_instance:
+            plan_name = info["name"]
+            billing_label = "Annual" if billing == "annual" else "Monthly"
+            try:
+                await bot_instance.send_message(
+                    user_id,
+                    f"✅ *Payment Successful!*\n\n"
+                    f"Plan: {plan_name} ({billing_label})\n"
+                    f"Duration: {days} days\n\n"
+                    f"Forwarding enjoy karo! 🚀",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.error(f"[Razorpay] User notify failed: {e}")
 
-    return web.Response(status=200, text="ok")
+        logger.info(f"[Razorpay] Payment confirmed: user={user_id} plan={plan} billing={billing}")
+
+    except Exception as e:
+        logger.error(f"[Razorpay] Webhook processing error: {e}", exc_info=True)
 
 
 def create_webhook_app() -> web.Application:
     app = web.Application()
     app.router.add_post("/webhook", webhook_handler)
-    app.router.add_get("/health", lambda r: web.Response(text="ok"))
     return app
